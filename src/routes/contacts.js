@@ -516,8 +516,8 @@ router.get('/', async (req, res) => {
       Contact.countDocuments(filter),
       Contact.find(filter)
         .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website')
-        .sort({ name: 1 })
-        .skip(skip)
+      .sort({ name: 1 })
+      .skip(skip)
         .limit(limitNum)
         .lean() // Use lean() for faster queries (returns plain JS objects)
     ]);

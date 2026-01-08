@@ -134,19 +134,19 @@ Return the output as a clean, readable business summary.`;
       try {
         completion = await groqClient.chat.completions.create({
           model,
-          messages: [
-            {
-              role: 'system',
-              content: 'You are a Business Expert specializing in company analysis and market research. Provide detailed, professional, and actionable insights.'
-            },
-            {
-              role: 'user',
-              content: prompt
-            }
-          ],
-          max_tokens: 2000,
-          temperature: 0.7
-        });
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a Business Expert specializing in company analysis and market research. Provide detailed, professional, and actionable insights.'
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      max_tokens: 2000,
+      temperature: 0.7
+    });
         lastErr = null;
         break;
       } catch (modelErr) {
