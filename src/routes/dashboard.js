@@ -462,9 +462,8 @@ router.get('/stats', async (req, res) => {
     const enrichmentCoveragePercent = totalContacts > 0 ? ((enrichedContacts / totalContacts) * 100).toFixed(1) : 0;
     const outreachReadyPercent = totalContacts > 0 ? ((outreachReady / totalContacts) * 100).toFixed(1) : 0;
     
-    res.json({
-      success: true,
-      data: {
+    // Build dashboard data object
+    const dashboardData = {
         // Key Metrics
         totalContacts: {
           value: totalContacts,
@@ -561,7 +560,6 @@ router.get('/stats', async (req, res) => {
           hasTitle: contactsWithTitle,
           readyForOutreach: outreachReady
         }
-      }
     };
     
     // Cache the results
