@@ -62,6 +62,7 @@ app.use('/api/import', require('./routes/import'));
 app.use('/api/linkedin', require('./routes/linkedin'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/company-analysis', require('./routes/company-analysis'));
+app.use('/api/categories', require('./routes/categories'));
 
 // Health check
 app.get('/api/health', (req, res) => {
