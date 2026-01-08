@@ -5,10 +5,6 @@ const Contact = require('../models/Contact');
 // Get dashboard statistics
 router.get('/stats', async (req, res) => {
   try {
-    const totalContacts = await Contact.countDocuments();
-    const companies = await Contact.distinct('company');
-    const totalAccounts = companies.filter(c => c && c.trim() !== '').length;
-    
     // Calculate date ranges
     const now = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -16,69 +12,63 @@ router.get('/stats', async (req, res) => {
     const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
     const threeMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 3, 1);
     const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 6, 1);
-    
-    // New contacts this month
-    const newContactsThisMonth = await Contact.countDocuments({
-      createdAt: { $gte: thisMonthStart }
-    });
-    
-    // Contacts with email
-    const contactsWithEmail = await Contact.countDocuments({
-      email: { $exists: true, $ne: '', $regex: /.+@.+\..+/ }
-    });
-    
-    // Contacts with valid email (basic validation)
-    const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const contactsWithValidEmail = await Contact.countDocuments({
-      email: { $regex: validEmailRegex }
-    });
-    
-    // Contacts with title
-    const contactsWithTitle = await Contact.countDocuments({
-      title: { $exists: true, $ne: '' }
-    });
-    
-    // Outreach ready (has email, title, and company)
-    const outreachReady = await Contact.countDocuments({
-      email: { $regex: validEmailRegex },
-      title: { $exists: true, $ne: '' },
-      company: { $exists: true, $ne: '' }
-    });
-    
-    // Enrichment coverage (contacts with LinkedIn URL)
-    const enrichedContacts = await Contact.countDocuments({
-      $or: [
-        { personLinkedinUrl: { $exists: true, $ne: '' } },
-        { companyLinkedinUrl: { $exists: true, $ne: '' } }
-      ]
-    });
-    
-    // Stale enrichment (>90 days old)
     const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-    const staleEnrichment = await Contact.countDocuments({
-      lastLinkedInFetch: { $lt: ninetyDaysAgo }
-    });
+    const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     
-    // Missing titles
-    const missingTitles = await Contact.countDocuments({
-      $or: [
-        { title: { $exists: false } },
-        { title: '' },
-        { title: null }
-      ]
-    });
+    // Run all count queries in parallel for better performance
+    const [
+      totalContacts,
+      companies,
+      newContactsThisMonth,
+      contactsWithEmail,
+      contactsWithValidEmail,
+      contactsWithTitle,
+      outreachReady,
+      enrichedContacts,
+      staleEnrichment,
+      missingTitles,
+      dncContacts,
+      contactsLastMonth
+    ] = await Promise.all([
+      Contact.countDocuments(),
+      Contact.distinct('company'),
+      Contact.countDocuments({ createdAt: { $gte: thisMonthStart } }),
+      Contact.countDocuments({ email: { $exists: true, $ne: '', $regex: /.+@.+\..+/ } }),
+      Contact.countDocuments({ email: { $regex: validEmailRegex } }),
+      Contact.countDocuments({ title: { $exists: true, $ne: '' } }),
+      Contact.countDocuments({
+        email: { $regex: validEmailRegex },
+        title: { $exists: true, $ne: '' },
+        company: { $exists: true, $ne: '' }
+      }),
+      Contact.countDocuments({
+        $or: [
+          { personLinkedinUrl: { $exists: true, $ne: '' } },
+          { companyLinkedinUrl: { $exists: true, $ne: '' } }
+        ]
+      }),
+      Contact.countDocuments({ lastLinkedInFetch: { $lt: ninetyDaysAgo } }),
+      Contact.countDocuments({
+        $or: [
+          { title: { $exists: false } },
+          { title: '' },
+          { title: null }
+        ]
+      }),
+      Contact.countDocuments({ email: { $in: ['', null] } }),
+      Contact.countDocuments({
+        createdAt: { $gte: lastMonthStart, $lte: lastMonthEnd }
+      })
+    ]);
     
-    // DNC contacts (if we had a DNC field, for now using empty email as proxy)
-    const dncContacts = await Contact.countDocuments({
-      email: { $in: ['', null] }
-    });
+    const totalAccounts = companies.filter(c => c && c.trim() !== '').length;
     
-    // Duplicate detection (same name and email)
+    // Duplicate detection (optimized with allowDiskUse for large datasets)
     const duplicates = await Contact.aggregate([
       {
         $match: {
-          name: { $exists: true, $ne: '' },
-          email: { $exists: true, $ne: '' }
+          name: { $exists: true, $ne: '', $ne: null },
+          email: { $exists: true, $ne: '', $ne: null }
         }
       },
       {
@@ -92,51 +82,65 @@ router.get('/stats', async (req, res) => {
       },
       {
         $match: { count: { $gt: 1 } }
+      },
+      {
+        $project: {
+          _id: 0,
+          count: 1,
+          duplicates: { $subtract: ['$count', 1] }
+        }
       }
-    ]);
-    const duplicateCount = duplicates.reduce((sum, dup) => sum + (dup.count - 1), 0);
+    ]).allowDiskUse(true);
+    const duplicateCount = duplicates.reduce((sum, dup) => sum + (dup.duplicates || 0), 0);
     
     // Calculate trends (comparing this month vs last month)
-    const contactsLastMonth = await Contact.countDocuments({
-      createdAt: { $gte: lastMonthStart, $lt: thisMonthStart }
-    });
     
     const newContactsTrend = contactsLastMonth > 0 
       ? ((newContactsThisMonth - contactsLastMonth) / contactsLastMonth * 100).toFixed(1)
       : 0;
     
     // Growth trend (contacts and accounts created in last 6 months - cumulative)
-    const monthlyGrowth = [];
-    let cumulativeContacts = 0;
-    let cumulativeAccounts = 0;
-    
+    // Optimize by running all queries in parallel
+    const monthQueries = [];
     for (let i = 5; i >= 0; i--) {
       const monthStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const monthEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 0);
       
-      // Count contacts created up to this month
-      const contactsUpToMonth = await Contact.countDocuments({
-        createdAt: { $lte: monthEnd }
-      });
-      
-      // Count unique companies up to this month
-      const companiesUpToMonth = await Contact.distinct('company', {
-        createdAt: { $lte: monthEnd },
-        company: { $exists: true, $ne: '' }
-      });
-      const accountsUpToMonth = companiesUpToMonth.filter(c => c && c.trim() !== '').length;
-      
-      monthlyGrowth.push({
-        month: monthStart.toLocaleDateString('en-US', { month: 'short' }),
-        contacts: contactsUpToMonth,
-        accounts: accountsUpToMonth
+      monthQueries.push({
+        monthStart,
+        monthEnd,
+        monthLabel: monthStart.toLocaleDateString('en-US', { month: 'short' }),
+        contactsPromise: Contact.countDocuments({ createdAt: { $lte: monthEnd } }),
+        companiesPromise: Contact.distinct('company', {
+          createdAt: { $lte: monthEnd },
+          company: { $exists: true, $ne: '', $ne: null }
+        })
       });
     }
     
-    // Top industries with detailed stats
+    // Execute all month queries in parallel
+    const monthResults = await Promise.all(
+      monthQueries.map(async ({ monthStart, monthEnd, monthLabel, contactsPromise, companiesPromise }) => {
+        const [contactsUpToMonth, companiesUpToMonth] = await Promise.all([
+          contactsPromise,
+          companiesPromise
+        ]);
+        const accountsUpToMonth = companiesUpToMonth.filter(c => c && c.trim() !== '').length;
+        
+        return {
+          month: monthLabel,
+          contacts: contactsUpToMonth,
+          accounts: accountsUpToMonth
+        };
+      })
+    );
+    
+    const monthlyGrowth = monthResults;
+    
+    // Top industries with detailed stats (optimized)
     const industryStats = await Contact.aggregate([
       {
-        $match: { industry: { $exists: true, $ne: '' } }
+        $match: { industry: { $exists: true, $ne: '', $ne: null } }
       },
       {
         $group: {
@@ -203,41 +207,61 @@ router.get('/stats', async (req, res) => {
       {
         $limit: 10
       }
-    ]);
+    ]).allowDiskUse(true);
 
-    // Calculate quarterly growth for each industry
-    // Note: threeMonthsAgo and sixMonthsAgo are already declared above
-    const industryGrowthStats = await Promise.all(
-      industryStats.map(async (item) => {
-        const industryName = item._id;
-        
-        // Count contacts created in last 3 months (this quarter)
-        const thisQuarter = await Contact.countDocuments({
-          industry: industryName,
-          createdAt: { $gte: threeMonthsAgo }
-        });
-        
-        // Count contacts created in previous 3 months (last quarter)
-        const lastQuarter = await Contact.countDocuments({
-          industry: industryName,
-          createdAt: { $gte: sixMonthsAgo, $lt: threeMonthsAgo }
-        });
-        
-        // Calculate growth rate
-        const growthRate = lastQuarter > 0 
-          ? ((thisQuarter - lastQuarter) / lastQuarter) * 100 
-          : thisQuarter > 0 ? 100 : 0;
-        
-        return {
-          name: industryName,
-          count: item.contacts,
-          accounts: item.accounts,
-          readyPercent: Math.round(item.readyPercent * 10) / 10,
-          enrichedPercent: Math.round(item.enrichedPercent * 10) / 10,
-          growthRate: Math.round(growthRate * 10) / 10
-        };
-      })
-    );
+    // Calculate quarterly growth for each industry using optimized aggregation
+    // Instead of individual queries, use a single aggregation pipeline
+    const industryIds = industryStats.map(s => s._id).filter(id => id);
+    const industryGrowthData = industryIds.length > 0 ? await Contact.aggregate([
+      {
+        $match: {
+          industry: { $in: industryIds },
+          createdAt: { $gte: sixMonthsAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            industry: '$industry',
+            quarter: {
+              $cond: [
+                { $gte: ['$createdAt', threeMonthsAgo] },
+                'thisQuarter',
+                'lastQuarter'
+              ]
+            }
+          },
+          count: { $sum: 1 }
+        }
+      }
+    ]).allowDiskUse(true) : [];
+    
+    // Process growth data
+    const growthMap = {};
+    industryGrowthData.forEach(item => {
+      const industry = item._id.industry;
+      if (!growthMap[industry]) {
+        growthMap[industry] = { thisQuarter: 0, lastQuarter: 0 };
+      }
+      growthMap[industry][item._id.quarter] = item.count;
+    });
+    
+    const industryGrowthStats = industryStats.map(item => {
+      const industryName = item._id;
+      const growth = growthMap[industryName] || { thisQuarter: 0, lastQuarter: 0 };
+      const growthRate = growth.lastQuarter > 0 
+        ? ((growth.thisQuarter - growth.lastQuarter) / growth.lastQuarter) * 100 
+        : growth.thisQuarter > 0 ? 100 : 0;
+      
+      return {
+        name: industryName,
+        count: item.contacts,
+        accounts: item.accounts,
+        readyPercent: Math.round(item.readyPercent * 10) / 10,
+        enrichedPercent: Math.round(item.enrichedPercent * 10) / 10,
+        growthRate: Math.round(growthRate * 10) / 10
+      };
+    });
 
     const topIndustries = industryGrowthStats;
     
@@ -277,45 +301,94 @@ router.get('/stats', async (req, res) => {
       } : null
     };
     
-    // Top countries
-    const topCountries = await Contact.aggregate([
-      {
-        $match: { country: { $exists: true, $ne: '' } }
-      },
-      {
-        $group: {
-          _id: '$country',
-          count: { $sum: 1 }
-        }
-      },
-      {
-        $sort: { count: -1 }
-      },
-      {
-        $limit: 10
-      }
-    ]);
+    // Run all remaining queries in parallel
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     
-    // Top states grouped by country
-    const statesByCountry = await Contact.aggregate([
-      {
-        $match: { 
-          state: { $exists: true, $ne: '' },
-          country: { $exists: true, $ne: '' }
+    const [
+      topCountries,
+      statesByCountry,
+      topStates,
+      fullyEnriched,
+      contactsWithPhone,
+      completeProfiles,
+      recentActivity
+    ] = await Promise.all([
+      // Top countries (optimized)
+      Contact.aggregate([
+        {
+          $match: { country: { $exists: true, $ne: '', $ne: null } }
+        },
+        {
+          $group: {
+            _id: '$country',
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $sort: { count: -1 }
+        },
+        {
+          $limit: 10
         }
-      },
-      {
-        $group: {
-          _id: {
-            country: '$country',
-            state: '$state'
-          },
-          count: { $sum: 1 }
+      ]).allowDiskUse(true),
+      // Top states grouped by country
+      Contact.aggregate([
+        {
+          $match: { 
+            state: { $exists: true, $ne: '', $ne: null },
+            country: { $exists: true, $ne: '', $ne: null }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              country: '$country',
+              state: '$state'
+            },
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $sort: { count: -1 }
         }
-      },
-      {
-        $sort: { count: -1 }
-      }
+      ]).allowDiskUse(true),
+      // Top states (for backward compatibility, showing top 5 overall)
+      Contact.aggregate([
+        {
+          $match: { state: { $exists: true, $ne: '', $ne: null } }
+        },
+        {
+          $group: {
+            _id: '$state',
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $sort: { count: -1 }
+        },
+        {
+          $limit: 5
+        }
+      ]).allowDiskUse(true),
+      // Enrichment status distribution
+      Contact.countDocuments({
+        personLinkedinUrl: { $exists: true, $ne: '' },
+        companyLinkedinUrl: { $exists: true, $ne: '' }
+      }),
+      // Data quality metrics
+      Contact.countDocuments({
+        firstPhone: { $exists: true, $ne: '' }
+      }),
+      Contact.countDocuments({
+        email: { $regex: validEmailRegex },
+        firstPhone: { $exists: true, $ne: '' },
+        title: { $exists: true, $ne: '' },
+        company: { $exists: true, $ne: '' }
+      }),
+      // Recent activity (contacts updated in last 30 days)
+      Contact.countDocuments({
+        updatedAt: { $gte: thirtyDaysAgo }
+      })
     ]);
     
     // Organize states by country
@@ -338,52 +411,15 @@ router.get('/stats', async (req, res) => {
       statesGrouped[country] = statesGrouped[country].slice(0, 5);
     });
     
-    // Top states (for backward compatibility, showing top 5 overall)
-    const topStates = await Contact.aggregate([
-      {
-        $match: { state: { $exists: true, $ne: '' } }
-      },
-      {
-        $group: {
-          _id: '$state',
-          count: { $sum: 1 }
-        }
-      },
-      {
-        $sort: { count: -1 }
-      },
-      {
-        $limit: 5
-      }
-    ]);
+    // Format topStates for response
+    const topStatesFormatted = topStates.map(item => ({
+      name: item._id,
+      count: item.count
+    }));
     
-    // Enrichment status distribution
-    const fullyEnriched = await Contact.countDocuments({
-      personLinkedinUrl: { $exists: true, $ne: '' },
-      companyLinkedinUrl: { $exists: true, $ne: '' }
-    });
     const partiallyEnriched = enrichedContacts - fullyEnriched;
     const notEnriched = totalContacts - enrichedContacts;
-    
-    // Data quality metrics
-    const contactsWithPhone = await Contact.countDocuments({
-      firstPhone: { $exists: true, $ne: '' }
-    });
-    
-    const completeProfiles = await Contact.countDocuments({
-      email: { $regex: validEmailRegex },
-      firstPhone: { $exists: true, $ne: '' },
-      title: { $exists: true, $ne: '' },
-      company: { $exists: true, $ne: '' }
-    });
-    
     const linkedinConnected = enrichedContacts;
-    
-    // Recent activity (contacts updated in last 30 days)
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const recentActivity = await Contact.countDocuments({
-      updatedAt: { $gte: thirtyDaysAgo }
-    });
     
     // Calculate percentages and trends
     const emailValidityPercent = totalContacts > 0 ? ((contactsWithValidEmail / totalContacts) * 100).toFixed(1) : 0;
@@ -457,7 +493,7 @@ router.get('/stats', async (req, res) => {
         topIndustries: topIndustries,
         industryInsights: industryInsights,
         topCountries: topCountries.map(item => ({ name: item._id, count: item.count })),
-        topStates: topStates.map(item => ({ name: item._id, count: item.count })),
+        topStates: topStatesFormatted,
         statesByCountry: statesGrouped,
         enrichmentStatus: {
           fullyEnriched: {

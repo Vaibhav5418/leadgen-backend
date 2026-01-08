@@ -97,6 +97,7 @@ router.get('/', async (req, res) => {
       page = 1, 
       limit = 50, 
       search,
+      filterCompany,
       filterIndustry,
       filterKeywords,
       filterCity,
@@ -278,6 +279,17 @@ router.get('/', async (req, res) => {
         filter = { $and: [filter, industryFilter] };
       } else {
         filter = industryFilter;
+      }
+    }
+    
+    if (filterCompany && filterCompany.trim()) {
+      const companyFilter = { company: { $regex: filterCompany.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(companyFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, companyFilter] };
+      } else {
+        filter = companyFilter;
       }
     }
     
@@ -499,14 +511,16 @@ router.get('/', async (req, res) => {
       }
     }
     
-    // Get total count for pagination
-    const totalCount = await Contact.countDocuments(filter);
-    
-    // Get paginated contacts
-    const contacts = await Contact.find(filter)
-      .sort({ name: 1 })
-      .skip(skip)
-      .limit(limitNum);
+    // Run count and find queries in parallel for better performance
+    const [totalCount, contacts] = await Promise.all([
+      Contact.countDocuments(filter),
+      Contact.find(filter)
+        .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website')
+        .sort({ name: 1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean() // Use lean() for faster queries (returns plain JS objects)
+    ]);
     
     res.json({
       success: true,
@@ -532,11 +546,350 @@ router.get('/', async (req, res) => {
 // Get all unique categories
 router.get('/categories', async (req, res) => {
   try {
-    const categories = await Contact.distinct('category');
-    const filteredCategories = categories.filter(cat => cat && cat.trim() !== '');
+    // Use distinct with a filter to exclude empty categories
+    const categories = await Contact.distinct('category', { 
+      category: { $exists: true, $ne: '', $ne: null } 
+    });
+    const filteredCategories = categories
+      .filter(cat => cat && cat.trim() !== '')
+      .sort();
     res.json({
       success: true,
-      data: filteredCategories.sort()
+      data: filteredCategories
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get all unique companies with contact counts
+router.get('/companies', async (req, res) => {
+  try {
+    const { 
+      category,
+      search,
+      filterKeywords,
+      filterCity,
+      filterState,
+      filterCountry,
+      filterHasLinkedIn,
+      filterHasEmail,
+      filterHasPhone
+    } = req.query;
+    
+    // Build filter for category if provided
+    let filter = { 
+      company: { $exists: true, $ne: '', $ne: null } 
+    };
+    
+    if (category && category !== 'All') {
+      // Use the same category matching logic as the main contacts route
+      const getKeyWords = (cat) => {
+        const words = cat
+          .split(/[&\s-]+/)
+          .map(w => w.trim())
+          .filter(w => 
+            w.length > 2 && 
+            !['the', 'and', 'for', 'with', 'from', 'and', 'or'].includes(w.toLowerCase())
+          );
+        return words;
+      };
+      
+      const queryWords = getKeyWords(category);
+      
+      if (category.includes('&') && queryWords.length > 0) {
+        const parts = category.trim().split(/\s*&\s*/);
+        const escapedParts = parts.map(part => 
+          part.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        );
+        const exactPattern = escapedParts.join('\\s*&\\s*');
+        const firstWord = queryWords[0]?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') || '';
+        const lastWord = queryWords[queryWords.length - 1]?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') || '';
+        
+        const patterns = [exactPattern];
+        if (firstWord && lastWord) {
+          patterns.push(`${firstWord}.*${lastWord}`);
+        }
+        
+        const validPatterns = patterns.filter(p => p && p.trim().length > 0);
+        if (validPatterns.length > 0) {
+          try {
+            const regexPattern = `^(${validPatterns.join('|')})$`;
+            new RegExp(regexPattern, 'i');
+            filter.category = { $regex: new RegExp(regexPattern, 'i') };
+          } catch (regexError) {
+            const escapedCategory = category.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            filter.category = { $regex: new RegExp(`^${escapedCategory}$`, 'i') };
+          }
+        } else {
+          const escapedCategory = category.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          filter.category = { $regex: new RegExp(`^${escapedCategory}$`, 'i') };
+        }
+      } else {
+        const escapedCategory = category.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        filter.category = { $regex: new RegExp(`^${escapedCategory}$`, 'i') };
+      }
+    }
+    
+    // Add search filter if provided
+    if (search && search.trim()) {
+      const searchTerm = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const searchFilter = {
+        $or: [
+          { name: { $regex: searchTerm, $options: 'i' } },
+          { email: { $regex: searchTerm, $options: 'i' } },
+          { company: { $regex: searchTerm, $options: 'i' } },
+          { title: { $regex: searchTerm, $options: 'i' } }
+        ]
+      };
+      
+      if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, searchFilter] };
+      } else {
+        filter = searchFilter;
+      }
+    }
+    
+    // Add additional filters (same logic as main contacts route)
+    if (filterKeywords && filterKeywords.trim()) {
+      const keywordsFilter = { keywords: { $regex: filterKeywords.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(keywordsFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, keywordsFilter] };
+      } else {
+        filter = keywordsFilter;
+      }
+    }
+    
+    if (filterCity && filterCity.trim()) {
+      const cityFilter = {
+        $or: [
+          { city: { $regex: filterCity.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+          { companyCity: { $regex: filterCity.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+        ]
+      };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(cityFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, cityFilter] };
+      } else {
+        filter = cityFilter;
+      }
+    }
+    
+    if (filterState && filterState.trim()) {
+      const stateFilter = {
+        $or: [
+          { state: { $regex: filterState.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+          { companyState: { $regex: filterState.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+        ]
+      };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(stateFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, stateFilter] };
+      } else {
+        filter = stateFilter;
+      }
+    }
+    
+    if (filterCountry && filterCountry.trim()) {
+      const countryFilter = {
+        $or: [
+          { country: { $regex: filterCountry.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+          { companyCountry: { $regex: filterCountry.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+        ]
+      };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(countryFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, countryFilter] };
+      } else {
+        filter = countryFilter;
+      }
+    }
+    
+    if (filterHasLinkedIn === 'yes') {
+      const linkedInFilter = {
+        $or: [
+          {
+            $and: [
+              { personLinkedinUrl: { $exists: true } },
+              { personLinkedinUrl: { $ne: '' } },
+              { personLinkedinUrl: { $ne: null } },
+              { personLinkedinUrl: { $not: { $regex: '^\\s*$' } } }
+            ]
+          },
+          {
+            $and: [
+              { companyLinkedinUrl: { $exists: true } },
+              { companyLinkedinUrl: { $ne: '' } },
+              { companyLinkedinUrl: { $ne: null } },
+              { companyLinkedinUrl: { $not: { $regex: '^\\s*$' } } }
+            ]
+          }
+        ]
+      };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(linkedInFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, linkedInFilter] };
+      } else {
+        filter = linkedInFilter;
+      }
+    } else if (filterHasLinkedIn === 'no') {
+      const noLinkedInFilter = {
+        $and: [
+          {
+            $or: [
+              { personLinkedinUrl: { $exists: false } },
+              { personLinkedinUrl: null },
+              { personLinkedinUrl: '' },
+              { personLinkedinUrl: { $regex: '^\\s*$' } }
+            ]
+          },
+          {
+            $or: [
+              { companyLinkedinUrl: { $exists: false } },
+              { companyLinkedinUrl: null },
+              { companyLinkedinUrl: '' },
+              { companyLinkedinUrl: { $regex: '^\\s*$' } }
+            ]
+          }
+        ]
+      };
+      if (Object.keys(filter).length > 0 && filter.$and) {
+        filter.$and.push(noLinkedInFilter);
+      } else if (Object.keys(filter).length > 0) {
+        filter = { $and: [filter, noLinkedInFilter] };
+      } else {
+        filter = noLinkedInFilter;
+      }
+    }
+    
+    if (filterHasEmail === 'yes') {
+      const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const emailFilter = {
+        $and: [
+          { email: { $exists: true } },
+          { email: { $ne: null } },
+          { email: { $ne: '' } },
+          { email: { $ne: '-' } },
+          { email: { $not: { $regex: /^\s*$/ } } },
+          { email: { $regex: validEmailRegex } },
+          { email: { $not: { $regex: /^(no\s*email|n\/a|na|none|not\s*available|no\s*data|-)$/i } } }
+        ]
+      };
+      if (Object.keys(filter).length > 0) {
+        if (filter.$and) {
+          filter.$and.push(...emailFilter.$and);
+        } else {
+          filter = { $and: [filter, ...emailFilter.$and] };
+        }
+      } else {
+        filter = emailFilter;
+      }
+    } else if (filterHasEmail === 'no') {
+      const noEmailFilter = {
+        $or: [
+          { email: { $exists: false } },
+          { email: null },
+          { email: '' },
+          { email: '-' },
+          { email: { $regex: /^\s*$/ } },
+          { email: { $not: { $regex: /^[^\s@]+@[^\s@]+\.[^\s@]+/ } } },
+          { email: { $regex: /^(no\s*email|n\/a|na|none|not\s*available|no\s*data|-)$/i } }
+        ]
+      };
+      if (Object.keys(filter).length > 0) {
+        if (filter.$and) {
+          filter.$and.push(noEmailFilter);
+        } else {
+          filter = { $and: [filter, noEmailFilter] };
+        }
+      } else {
+        filter = noEmailFilter;
+      }
+    }
+    
+    if (filterHasPhone === 'yes') {
+      const phoneConditions = [
+        { firstPhone: { $exists: true } },
+        { firstPhone: { $ne: null } },
+        { firstPhone: { $ne: '' } },
+        { firstPhone: { $not: { $regex: /^\s*$/ } } }
+      ];
+      if (Object.keys(filter).length > 0) {
+        if (filter.$and) {
+          filter.$and = filter.$and.concat(phoneConditions);
+        } else {
+          filter = { $and: [filter, ...phoneConditions] };
+        }
+      } else {
+        filter = { $and: phoneConditions };
+      }
+    } else if (filterHasPhone === 'no') {
+      const noPhoneFilter = {
+        $or: [
+          { firstPhone: { $exists: false } },
+          { firstPhone: null },
+          { firstPhone: '' },
+          { firstPhone: { $regex: /^\s*$/ } }
+        ]
+      };
+      if (Object.keys(filter).length > 0) {
+        if (filter.$and) {
+          filter.$and.push(noPhoneFilter);
+        } else {
+          filter = { $and: [filter, noPhoneFilter] };
+        }
+      } else {
+        filter = noPhoneFilter;
+      }
+    }
+    
+    // Aggregate to get companies with contact counts (optimized)
+    const companiesWithCounts = await Contact.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: '$company',
+          count: { $sum: 1 }
+        }
+      },
+      {
+        $match: {
+          _id: { $exists: true, $ne: null, $ne: '' }
+        }
+      },
+      {
+        $project: {
+          name: { $trim: { input: '$_id' } },
+          count: 1,
+          _id: 0
+        }
+      },
+      {
+        $match: {
+          name: { $ne: '' }
+        }
+      },
+      { $sort: { name: 1 } }
+    ]);
+    
+    // Format results
+    const uniqueCompanies = companiesWithCounts.map(item => ({
+      name: item.name,
+      count: item.count
+    }));
+    
+    res.json({
+      success: true,
+      data: uniqueCompanies
     });
   } catch (error) {
     res.status(500).json({
