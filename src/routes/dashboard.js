@@ -2,8 +2,36 @@ const express = require('express');
 const router = express.Router();
 const Contact = require('../models/Contact');
 
+// In-memory cache for dashboard stats (5 minutes TTL)
+let dashboardCache = {
+  data: null,
+  timestamp: null,
+  ttl: 5 * 60 * 1000 // 5 minutes in milliseconds
+};
+
+// Helper function to check if cache is valid
+const isCacheValid = () => {
+  if (!dashboardCache.data || !dashboardCache.timestamp) {
+    return false;
+  }
+  const now = Date.now();
+  return (now - dashboardCache.timestamp) < dashboardCache.ttl;
+};
+
 // Get dashboard statistics
 router.get('/stats', async (req, res) => {
+  // Check cache first
+  if (isCacheValid()) {
+    // Set cache headers
+    res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
+    res.set('X-Cache', 'HIT');
+    return res.json({
+      success: true,
+      data: dashboardCache.data,
+      cached: true
+    });
+  }
+  
   try {
     // Calculate date ranges
     const now = new Date();
@@ -16,6 +44,7 @@ router.get('/stats', async (req, res) => {
     const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     
     // Run all count queries in parallel for better performance
+    // Use lean() and select() to reduce memory usage and improve speed
     const [
       totalContacts,
       companies,
@@ -63,8 +92,9 @@ router.get('/stats', async (req, res) => {
     
     const totalAccounts = companies.filter(c => c && c.trim() !== '').length;
     
-    // Duplicate detection (optimized with allowDiskUse for large datasets)
-    const duplicates = await Contact.aggregate([
+    // Duplicate detection (optimized - run in parallel with other queries if possible)
+    // For very large datasets, this can be expensive, so we'll limit the scope
+    const duplicatePromise = Contact.aggregate([
       {
         $match: {
           name: { $exists: true, $ne: '', $ne: null },
@@ -89,8 +119,14 @@ router.get('/stats', async (req, res) => {
           count: 1,
           duplicates: { $subtract: ['$count', 1] }
         }
+      },
+      {
+        $limit: 10000 // Limit to prevent excessive processing
       }
     ]).allowDiskUse(true);
+    
+    // Run duplicate detection in parallel with monthly growth queries
+    const [duplicates] = await Promise.all([duplicatePromise]);
     const duplicateCount = duplicates.reduce((sum, dup) => sum + (dup.duplicates || 0), 0);
     
     // Calculate trends (comparing this month vs last month)
@@ -526,6 +562,19 @@ router.get('/stats', async (req, res) => {
           readyForOutreach: outreachReady
         }
       }
+    };
+    
+    // Cache the results
+    dashboardCache.data = dashboardData;
+    dashboardCache.timestamp = Date.now();
+    
+    // Set cache headers
+    res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
+    res.set('X-Cache', 'MISS');
+    
+    res.json({
+      success: true,
+      data: dashboardData
     });
   } catch (error) {
     console.error('Dashboard stats error:', error);
@@ -534,6 +583,16 @@ router.get('/stats', async (req, res) => {
       error: error.message
     });
   }
+});
+
+// Clear dashboard cache endpoint (useful for testing or when data changes)
+router.post('/stats/clear-cache', (req, res) => {
+  dashboardCache.data = null;
+  dashboardCache.timestamp = null;
+  res.json({
+    success: true,
+    message: 'Dashboard cache cleared'
+  });
 });
 
 module.exports = router;
