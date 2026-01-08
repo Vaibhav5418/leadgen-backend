@@ -156,7 +156,7 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   try {
     console.log('=== Login Request ===');
-    console.log('Request body:', { email, password: '***' });
+    console.log('Request body:', { email: req.body?.email, password: '***' });
     
     // Check database connection
     if (!checkDatabaseConnection()) {
@@ -214,7 +214,19 @@ router.post('/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('=== Login Error ===');
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Full error:', error);
+    
+    // Handle database errors
+    if (error.name === 'MongoServerError' || error.message?.includes('Mongo')) {
+      return res.status(500).json({
+        success: false,
+        error: 'Database connection error. Please try again later.'
+      });
+    }
+    
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to login'
