@@ -85,6 +85,25 @@ const activitySchema = new mongoose.Schema({
     trim: true,
     default: null
   },
+  lnRequestSent: {
+    type: String,
+    required: false,
+    enum: [
+      'Yes',
+      'No',
+      'Existing Connect',
+      'Inactive Profile',
+      'Irrelevant Profile',
+      'Open to Work'
+    ],
+    default: null
+  },
+  connected: {
+    type: String,
+    required: false,
+    enum: ['Yes', 'No'],
+    default: null
+  },
   callNumber: {
     type: String,
     required: false,
@@ -134,5 +153,9 @@ activitySchema.index({ type: 1 });
 activitySchema.index({ createdAt: -1 });
 activitySchema.index({ createdBy: 1 });
 activitySchema.index({ nextActionDate: 1 }); // Index for next action date filtering
+activitySchema.index({ projectId: 1, type: 1, createdAt: -1 }); // Compound index for filtered project activities
+activitySchema.index({ contactId: 1, type: 1, createdAt: -1 }); // Compound index for filtered contact activities
+activitySchema.index({ status: 1, createdAt: -1 }); // Index for status-based queries
+activitySchema.index({ projectId: 1, status: 1 }); // Index for project status filtering
 
 module.exports = mongoose.model('Activity', activitySchema);
