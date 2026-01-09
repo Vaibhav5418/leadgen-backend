@@ -530,15 +530,13 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
     }
 
     // Limit contacts to improve performance - fetch only top matches
-    const limit = parseInt(req.query.limit) || 300; // Reduced from 500 for better performance
-    const skip = parseInt(req.query.skip) || 0;
+    const limit = parseInt(req.query.limit) || 500; // Default to 500, allow override
     
     // Get similar contacts from databank (excluding already imported ones)
     // Use lean() for better performance and limit results
     const similarContacts = await Contact.find(contactFilter)
       .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
       .limit(limit)
-      .skip(skip)
       .lean();
 
     // Start with imported contacts (these are priority and always shown)

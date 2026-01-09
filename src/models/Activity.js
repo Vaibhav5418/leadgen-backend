@@ -153,9 +153,5 @@ activitySchema.index({ type: 1 });
 activitySchema.index({ createdAt: -1 });
 activitySchema.index({ createdBy: 1 });
 activitySchema.index({ nextActionDate: 1 }); // Index for next action date filtering
-activitySchema.index({ projectId: 1, type: 1, createdAt: -1 }); // Compound index for filtered project activities
-activitySchema.index({ contactId: 1, type: 1, createdAt: -1 }); // Compound index for filtered contact activities
-activitySchema.index({ status: 1, createdAt: -1 }); // Index for status-based queries
-activitySchema.index({ projectId: 1, status: 1 }); // Index for project status filtering
 
 module.exports = mongoose.model('Activity', activitySchema);

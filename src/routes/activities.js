@@ -103,27 +103,16 @@ router.post('/', authenticate, async (req, res) => {
 // Get all activities for a project
 router.get('/project/:projectId', authenticate, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 500; // Reduced limit for better performance
-    const skip = parseInt(req.query.skip) || 0;
-    
+    const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
     const activities = await Activity.find({ projectId: req.params.projectId })
-      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status linkedInAccountName lnRequestSent connected callNumber callStatus callDate createdAt')
+      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt')
       .sort({ createdAt: -1 })
       .limit(limit)
-      .skip(skip)
       .lean();
-
-    const total = await Activity.countDocuments({ projectId: req.params.projectId });
 
     res.json({
       success: true,
-      data: activities,
-      pagination: {
-        total,
-        limit,
-        skip,
-        hasMore: skip + activities.length < total
-      }
+      data: activities
     });
   } catch (error) {
     console.error('Error fetching activities:', error);
@@ -137,28 +126,14 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
 // Get all activities for a contact
 router.get('/contact/:contactId', authenticate, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 500; // Limit for performance
-    const skip = parseInt(req.query.skip) || 0;
-    
     const activities = await Activity.find({ contactId: req.params.contactId })
-      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status linkedInAccountName lnRequestSent connected callNumber callStatus callDate createdAt')
       .populate('projectId', 'companyName')
       .sort({ createdAt: -1 })
-      .limit(limit)
-      .skip(skip)
       .lean();
-
-    const total = await Activity.countDocuments({ contactId: req.params.contactId });
 
     res.json({
       success: true,
-      data: activities,
-      pagination: {
-        total,
-        limit,
-        skip,
-        hasMore: skip + activities.length < total
-      }
+      data: activities
     });
   } catch (error) {
     console.error('Error fetching contact activities:', error);
