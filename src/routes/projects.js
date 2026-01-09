@@ -948,12 +948,17 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
 
     // Handle duplicate emails in the CSV by making them unique
     const emailSet = new Set();
+    let duplicatesInCSV = 0;
     const uniqueContacts = contacts.map((contact, index) => {
       let email = contact.email;
       let counter = 1;
+      const isDuplicate = emailSet.has(email);
       
       // If email already exists, make it unique by appending a number
       while (emailSet.has(email)) {
+        if (counter === 1) {
+          duplicatesInCSV++; // Count the duplicate
+        }
         const baseEmail = contact.email.includes('@') 
           ? contact.email.split('@')[0] 
           : `contact${index}`;
@@ -1286,6 +1291,53 @@ router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, 
     res.status(400).json({
       success: false,
       error: error.message || 'Failed to update project-contact'
+    });
+  }
+});
+
+// Delete project contacts (bulk remove prospects from project)
+router.delete('/:projectId/project-contacts', authenticate, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { contactIds } = req.body; // Array of contact IDs to remove
+
+    if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Contact IDs array is required'
+      });
+    }
+
+    // Verify project exists
+    const project = await Project.findOne({ _id: projectId });
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    // Convert contact IDs to ObjectIds
+    const contactObjectIds = contactIds.map(id => new mongoose.Types.ObjectId(id));
+
+    // Delete project-contact links
+    const result = await ProjectContact.deleteMany({
+      projectId: projectId,
+      contactId: { $in: contactObjectIds }
+    });
+
+    res.json({
+      success: true,
+      message: `Successfully removed ${result.deletedCount} prospect(s) from project`,
+      data: {
+        deletedCount: result.deletedCount
+      }
+    });
+  } catch (error) {
+    console.error('Error removing prospects from project:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to remove prospects from project'
     });
   }
 });
