@@ -27,28 +27,47 @@ router.post('/', authenticate, async (req, res) => {
       callDate
     } = req.body;
 
-    // Validate required fields (conversationNotes is now optional)
-    if (!projectId || !type || !outcome || !nextAction || !nextActionDate) {
+    // Validate required fields
+    if (!projectId || !type) {
       return res.status(400).json({
         success: false,
-        error: 'All required fields must be provided'
+        error: 'Project ID and activity type are required'
       });
     }
 
-    // Validate conversation notes length
-    // Conversation Notes is now optional - no minimum length validation
-
-    // Validate next action date is within 7 days
-    const selectedDate = new Date(nextActionDate);
-    const today = new Date();
-    const maxDate = new Date(today);
-    maxDate.setDate(maxDate.getDate() + 7);
-
-    if (selectedDate > maxDate) {
+    // Status is required for Email and LinkedIn activities
+    if ((type === 'email' || type === 'linkedin') && !status) {
       return res.status(400).json({
         success: false,
-        error: 'Next action must be scheduled within 7 days'
+        error: 'Status is required for email and LinkedIn activities'
       });
+    }
+
+    // Conversation Notes is now optional - no minimum length validation
+
+    // Next action and date are now optional
+    // But if nextAction is provided, nextActionDate should also be provided
+    if (nextAction && !nextActionDate) {
+      return res.status(400).json({
+        success: false,
+        error: 'Next action date is required when next action is specified'
+      });
+    }
+
+    // Validate next action date is within 7 days (if provided)
+    let selectedDate = null;
+    if (nextActionDate) {
+      selectedDate = new Date(nextActionDate);
+      const today = new Date();
+      const maxDate = new Date(today);
+      maxDate.setDate(maxDate.getDate() + 7);
+
+      if (selectedDate > maxDate) {
+        return res.status(400).json({
+          success: false,
+          error: 'Next action must be scheduled within 7 days'
+        });
+      }
     }
 
     const activity = new Activity({
@@ -56,10 +75,10 @@ router.post('/', authenticate, async (req, res) => {
       contactId: contactId || null,
       type,
       template: template || '',
-      outcome,
+      outcome: null, // Outcome is not used for any activity types
       conversationNotes: conversationNotes ? conversationNotes.trim() : '',
-      nextAction,
-      nextActionDate: selectedDate,
+      nextAction: nextAction || null,
+      nextActionDate: selectedDate || null,
       phoneNumber: phoneNumber || null,
       email: email || null,
       linkedInUrl: linkedInUrl || null,

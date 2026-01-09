@@ -23,8 +23,9 @@ const activitySchema = new mongoose.Schema({
   },
   outcome: {
     type: String,
-    required: true,
-    trim: true
+    required: false,
+    trim: true,
+    default: null
   },
   conversationNotes: {
     type: String,
@@ -34,12 +35,14 @@ const activitySchema = new mongoose.Schema({
   },
   nextAction: {
     type: String,
-    required: true,
-    trim: true
+    required: false,
+    trim: true,
+    default: null
   },
   nextActionDate: {
     type: Date,
-    required: true
+    required: false,
+    default: null
   },
   phoneNumber: {
     type: String,
@@ -63,13 +66,20 @@ const activitySchema = new mongoose.Schema({
     type: String,
     required: false,
     enum: [
-      'CIP',
+      // Email status options
       'No Reply',
       'Not Interested',
+      'Out of Office',
       'Meeting Proposed',
       'Meeting Scheduled',
-      'In-Person Meeting',
+      'Interested',
+      'Wrong Person',
+      'Bounce',
+      'Opt-Out',
       'Meeting Completed',
+      // LinkedIn status options
+      'CIP',
+      'In-Person Meeting',
       'SQL',
       'Tech Discussion',
       'WON',

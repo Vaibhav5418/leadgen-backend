@@ -275,19 +275,35 @@ const parseCompanySize = (employeesStr) => {
   return maxNum;
 };
 
-// Helper function to calculate ICP match score
+// Helper function to calculate ICP match score with detailed recommendations
 const calculateMatchScore = (contact, icpDefinition) => {
   let score = 0;
   let maxScore = 0;
+  const recommendationReasons = [];
+  const matchedCriteria = {
+    industries: [],
+    jobTitles: [],
+    companySize: false,
+    geographies: [],
+    keywords: []
+  };
 
   // Industry match (30 points)
   if (icpDefinition?.targetIndustries && icpDefinition.targetIndustries.length > 0) {
     maxScore += 30;
     const contactIndustry = (contact.industry || '').toLowerCase();
-    if (icpDefinition.targetIndustries.some(ind => 
+    const matchedIndustries = icpDefinition.targetIndustries.filter(ind => 
       contactIndustry.includes(ind.toLowerCase()) || ind.toLowerCase().includes(contactIndustry)
-    )) {
+    );
+    if (matchedIndustries.length > 0) {
       score += 30;
+      matchedCriteria.industries = matchedIndustries;
+      recommendationReasons.push({
+        type: 'industry',
+        weight: 30,
+        matched: matchedIndustries,
+        message: `Matches ${matchedIndustries.length} target industr${matchedIndustries.length === 1 ? 'y' : 'ies'}: ${matchedIndustries.join(', ')}`
+      });
     }
   }
 
@@ -295,10 +311,18 @@ const calculateMatchScore = (contact, icpDefinition) => {
   if (icpDefinition?.targetJobTitles && icpDefinition.targetJobTitles.length > 0) {
     maxScore += 25;
     const contactTitle = (contact.title || '').toLowerCase();
-    if (icpDefinition.targetJobTitles.some(jt => 
+    const matchedTitles = icpDefinition.targetJobTitles.filter(jt => 
       contactTitle.includes(jt.toLowerCase()) || jt.toLowerCase().includes(contactTitle)
-    )) {
+    );
+    if (matchedTitles.length > 0) {
       score += 25;
+      matchedCriteria.jobTitles = matchedTitles;
+      recommendationReasons.push({
+        type: 'jobTitle',
+        weight: 25,
+        matched: matchedTitles,
+        message: `Matches target job title${matchedTitles.length === 1 ? '' : 's'}: ${matchedTitles.join(', ')}`
+      });
     }
   }
 
@@ -308,6 +332,13 @@ const calculateMatchScore = (contact, icpDefinition) => {
     const companySize = parseCompanySize(contact.employees);
     if (companySize && companySize >= icpDefinition.companySizeMin && companySize <= icpDefinition.companySizeMax) {
       score += 20;
+      matchedCriteria.companySize = true;
+      recommendationReasons.push({
+        type: 'companySize',
+        weight: 20,
+        matched: [companySize],
+        message: `Company size (${companySize.toLocaleString()} employees) matches target range (${icpDefinition.companySizeMin.toLocaleString()}-${icpDefinition.companySizeMax.toLocaleString()})`
+      });
     }
   }
 
@@ -319,10 +350,18 @@ const calculateMatchScore = (contact, icpDefinition) => {
       contact.companyCity, contact.companyState, contact.companyCountry
     ].filter(Boolean).join(' ').toLowerCase();
     
-    if (icpDefinition.geographies.some(geo => 
+    const matchedGeos = icpDefinition.geographies.filter(geo => 
       contactLocation.includes(geo.toLowerCase())
-    )) {
+    );
+    if (matchedGeos.length > 0) {
       score += 15;
+      matchedCriteria.geographies = matchedGeos;
+      recommendationReasons.push({
+        type: 'geography',
+        weight: 15,
+        matched: matchedGeos,
+        message: `Located in target geograph${matchedGeos.length === 1 ? 'y' : 'ies'}: ${matchedGeos.join(', ')}`
+      });
     }
   }
 
@@ -334,11 +373,28 @@ const calculateMatchScore = (contact, icpDefinition) => {
       contactKeywords.includes(kw.toLowerCase())
     );
     if (matchedKeywords.length > 0) {
-      score += Math.min(10, (matchedKeywords.length / icpDefinition.keywords.length) * 10);
+      const keywordScore = Math.min(10, (matchedKeywords.length / icpDefinition.keywords.length) * 10);
+      score += keywordScore;
+      matchedCriteria.keywords = matchedKeywords;
+      recommendationReasons.push({
+        type: 'keywords',
+        weight: 10,
+        matched: matchedKeywords,
+        message: `Matches ${matchedKeywords.length} of ${icpDefinition.keywords.length} target keyword${matchedKeywords.length === 1 ? '' : 's'}: ${matchedKeywords.join(', ')}`
+      });
     }
   }
 
-  return { score, maxScore, percentage: maxScore > 0 ? (score / maxScore) * 100 : 0 };
+  // Sort recommendation reasons by weight (highest first)
+  recommendationReasons.sort((a, b) => b.weight - a.weight);
+
+  return { 
+    score, 
+    maxScore, 
+    percentage: maxScore > 0 ? (score / maxScore) * 100 : 0,
+    recommendationReasons,
+    matchedCriteria
+  };
 };
 
 // Get imported contacts for a project (only contacts already linked to project)
@@ -404,19 +460,66 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
 
     const icpDefinition = project.icpDefinition || {};
 
+    // Check if ICP is defined - must have at least one meaningful criteria
+    // Exclude default company size values (0-1000) as they're not meaningful
+    const hasMeaningfulCompanySize = icpDefinition.companySizeMin !== undefined && 
+                                     icpDefinition.companySizeMax !== undefined &&
+                                     !(icpDefinition.companySizeMin === 0 && icpDefinition.companySizeMax === 1000);
+    
+    const hasICP = (
+      (icpDefinition.targetIndustries && Array.isArray(icpDefinition.targetIndustries) && icpDefinition.targetIndustries.length > 0) ||
+      (icpDefinition.targetJobTitles && Array.isArray(icpDefinition.targetJobTitles) && icpDefinition.targetJobTitles.length > 0) ||
+      (icpDefinition.geographies && Array.isArray(icpDefinition.geographies) && icpDefinition.geographies.length > 0) ||
+      (icpDefinition.keywords && Array.isArray(icpDefinition.keywords) && icpDefinition.keywords.length > 0) ||
+      hasMeaningfulCompanySize
+    );
+
+    if (!hasICP) {
+      // Return only imported contacts if no ICP is defined
+      const importedProjectContacts = await ProjectContact.find({ projectId: project._id })
+        .populate('contactId', 'name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
+        .lean();
+
+      const contacts = importedProjectContacts
+        .filter(pc => pc.contactId && pc.contactId._id)
+        .map(pc => {
+          const contact = { ...pc.contactId };
+          contact._id = pc.contactId._id;
+          contact.projectContactId = pc._id;
+          contact.stage = pc.stage || 'New';
+          contact.assignedTo = pc.assignedTo || '';
+          contact.priority = pc.priority || 'Medium';
+          contact.isImported = true;
+          contact.matchType = 'imported';
+          return contact;
+        });
+
+      return res.json({
+        success: true,
+        data: contacts,
+        count: contacts.length,
+        hasICP: false,
+        message: 'No ICP defined for this project. Please add an ICP definition to get suggestions.',
+        matchStats: {
+          exact: 0,
+          good: 0,
+          similar: 0,
+          loose: 0,
+          imported: contacts.length
+        }
+      });
+    }
+
     // Build query to find similar contacts based on ICP criteria
     let contactFilter = {};
     const orConditions = [];
 
-    // Match by ICP target industries
+    // Match by ICP target industries (only if defined in ICP, no fallback)
     if (icpDefinition.targetIndustries && icpDefinition.targetIndustries.length > 0) {
       const industryRegex = icpDefinition.targetIndustries.map(ind => 
         new RegExp(ind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
       );
       orConditions.push({ industry: { $in: industryRegex } });
-    } else if (project.industry) {
-      // Fallback to project industry if no ICP industries defined
-      orConditions.push({ industry: { $regex: project.industry, $options: 'i' } });
     }
 
     // Match by ICP target job titles
@@ -427,7 +530,7 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       orConditions.push({ title: { $in: titleRegex } });
     }
 
-    // Match by ICP geographies
+    // Match by ICP geographies (only if defined in ICP, no fallback)
     if (icpDefinition.geographies && icpDefinition.geographies.length > 0) {
       const geoConditions = [];
       icpDefinition.geographies.forEach(geo => {
@@ -442,20 +545,6 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
         );
       });
       orConditions.push({ $or: geoConditions });
-    } else if (project.city || project.country) {
-      // Fallback to project location
-      const geoConditions = [];
-      if (project.city) {
-        const cityRegex = new RegExp(project.city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        geoConditions.push({ city: cityRegex }, { companyCity: cityRegex });
-      }
-      if (project.country) {
-        const countryRegex = new RegExp(project.country.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        geoConditions.push({ country: countryRegex }, { companyCountry: countryRegex });
-      }
-      if (geoConditions.length > 0) {
-        orConditions.push({ $or: geoConditions });
-      }
     }
 
     // Match by ICP keywords
@@ -471,9 +560,40 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       contactFilter.$or = orConditions;
     }
 
-    // If no ICP criteria, get all contacts (fallback)
-    if (Object.keys(contactFilter).length === 0) {
-      contactFilter = {};
+    // If no ICP criteria found, return only imported contacts (don't show suggestions)
+    if (orConditions.length === 0) {
+      const importedProjectContacts = await ProjectContact.find({ projectId: project._id })
+        .populate('contactId', 'name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
+        .lean();
+
+      const contacts = importedProjectContacts
+        .filter(pc => pc.contactId && pc.contactId._id)
+        .map(pc => {
+          const contact = { ...pc.contactId };
+          contact._id = pc.contactId._id;
+          contact.projectContactId = pc._id;
+          contact.stage = pc.stage || 'New';
+          contact.assignedTo = pc.assignedTo || '';
+          contact.priority = pc.priority || 'Medium';
+          contact.isImported = true;
+          contact.matchType = 'imported';
+          return contact;
+        });
+
+      return res.json({
+        success: true,
+        data: contacts,
+        count: contacts.length,
+        hasICP: false,
+        message: 'No ICP criteria found. Please add ICP definition to get suggestions.',
+        matchStats: {
+          exact: 0,
+          good: 0,
+          similar: 0,
+          loose: 0,
+          imported: contacts.length
+        }
+      });
     }
 
     // Exclude the project's contact person if they exist in the database
@@ -561,7 +681,7 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       for (const contact of batch) {
         const contactId = contact._id.toString();
         if (!importedContactIds.has(contactId)) {
-          // Calculate ICP match score
+          // Calculate ICP match score with detailed recommendations
           const matchResult = calculateMatchScore(contact, icpDefinition);
           const matchPercentage = matchResult.percentage;
           
@@ -580,6 +700,8 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
           contact.matchScore = Math.round(matchPercentage);
           contact.matchType = matchType;
           contact.isImported = false;
+          contact.recommendationReasons = matchResult.recommendationReasons;
+          contact.matchedCriteria = matchResult.matchedCriteria;
           
           // Check if this contact has project contact data (shouldn't happen, but just in case)
           if (importedContactMap.has(contactId)) {
@@ -625,6 +747,7 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       success: true,
       data: allContacts,
       count: allContacts.length,
+      hasICP: true,
       matchStats: {
         exact: scoredContacts.filter(c => c.matchType === 'exact').length,
         good: scoredContacts.filter(c => c.matchType === 'good').length,
