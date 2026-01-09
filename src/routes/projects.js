@@ -961,40 +961,78 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             normalizedRow[key.toLowerCase().trim()] = row[key];
           });
 
-          // Get values with case-insensitive matching
+          // Get values with case-insensitive matching for all fields
           const name = normalizedRow['name'] || '';
           const email = normalizedRow['email'] || '';
           const company = normalizedRow['company'] || '';
-          const phone = normalizedRow['phone'] || '';
           const title = normalizedRow['title'] || '';
-          // Support multiple LinkedIn column name variations
-          const linkedinUrl = normalizedRow['linkedin'] || 
-                              normalizedRow['linkedinurl'] || 
-                              normalizedRow['linkedin url'] || 
-                              normalizedRow['personlinkedinurl'] || 
-                              normalizedRow['person linkedin url'] || 
-                              normalizedRow['linkedin profile'] || 
-                              normalizedRow['linkedinprofile'] || '';
+          const firstPhone = normalizedRow['first phone'] || normalizedRow['firstphone'] || normalizedRow['phone'] || '';
+          const employees = normalizedRow['employees'] || '';
+          const category = normalizedRow['category'] || '';
+          const industry = normalizedRow['industry'] || '';
+          const keywords = normalizedRow['keywords'] || '';
+          const personLinkedinUrl = normalizedRow['person linkedin url'] || normalizedRow['personlinkedinurl'] || 
+                                   normalizedRow['linkedin'] || normalizedRow['linkedinurl'] || 
+                                   normalizedRow['linkedin url'] || normalizedRow['linkedin profile'] || 
+                                   normalizedRow['linkedinprofile'] || '';
+          const website = normalizedRow['website'] || '';
+          const companyLinkedinUrl = normalizedRow['company linkedin url'] || normalizedRow['companylinkedinurl'] || '';
+          const facebookUrl = normalizedRow['facebook url'] || normalizedRow['facebookurl'] || '';
+          const twitterUrl = normalizedRow['twitter url'] || normalizedRow['twitterurl'] || '';
+          const city = normalizedRow['city'] || '';
+          const state = normalizedRow['state'] || '';
+          const country = normalizedRow['country'] || '';
+          const companyAddress = normalizedRow['company address'] || normalizedRow['companyaddress'] || '';
+          const companyCity = normalizedRow['company city'] || normalizedRow['companycity'] || '';
+          const companyState = normalizedRow['company state'] || normalizedRow['companystate'] || '';
+          const companyCountry = normalizedRow['company country'] || normalizedRow['companycountry'] || '';
+          const companyPhone = normalizedRow['company phone'] || normalizedRow['companyphone'] || '';
+          const seoDescription = normalizedRow['seo description'] || normalizedRow['seodescription'] || '';
+          const technologies = normalizedRow['technologies'] || '';
+          const annualRevenue = normalizedRow['annual revenue'] || normalizedRow['annualrevenue'] || '';
 
           // Skip completely empty rows
-          const hasAnyData = name || email || company || phone || title || linkedinUrl;
+          const hasAnyData = name || email || company || title || firstPhone || employees || category || 
+                           industry || keywords || personLinkedinUrl || website || companyLinkedinUrl || 
+                           facebookUrl || twitterUrl || city || state || country || companyAddress || 
+                           companyCity || companyState || companyCountry || companyPhone || seoDescription || 
+                           technologies || annualRevenue;
           if (!hasAnyData) {
             return; // Skip empty rows silently
           }
 
-          // Generate default values for missing fields (no validation)
+          // Generate default values for required fields (no validation)
           const trimmedName = name ? name.toString().trim() : `Contact ${rowNumber}`;
           let trimmedEmail = email ? email.toString().trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
           const trimmedCompany = company ? company.toString().trim() : 'Unknown Company';
 
-          // Create contact object (accept any data, no validation)
+          // Create contact object with all fields (accept any data, no validation)
           contacts.push({
             name: trimmedName,
             email: trimmedEmail,
             company: trimmedCompany,
-            firstPhone: phone ? phone.toString().trim() : '',
             title: title ? title.toString().trim() : '',
-            personLinkedinUrl: linkedinUrl ? linkedinUrl.toString().trim() : ''
+            firstPhone: firstPhone ? firstPhone.toString().trim() : '',
+            employees: employees ? employees.toString().trim() : '',
+            category: category ? category.toString().trim() : '',
+            industry: industry ? industry.toString().trim() : '',
+            keywords: keywords ? keywords.toString().trim() : '',
+            personLinkedinUrl: personLinkedinUrl ? personLinkedinUrl.toString().trim() : '',
+            website: website ? website.toString().trim() : '',
+            companyLinkedinUrl: companyLinkedinUrl ? companyLinkedinUrl.toString().trim() : '',
+            facebookUrl: facebookUrl ? facebookUrl.toString().trim() : '',
+            twitterUrl: twitterUrl ? twitterUrl.toString().trim() : '',
+            city: city ? city.toString().trim() : '',
+            state: state ? state.toString().trim() : '',
+            country: country ? country.toString().trim() : '',
+            companyAddress: companyAddress ? companyAddress.toString().trim() : '',
+            companyCity: companyCity ? companyCity.toString().trim() : '',
+            companyState: companyState ? companyState.toString().trim() : '',
+            companyCountry: companyCountry ? companyCountry.toString().trim() : '',
+            companyPhone: companyPhone ? companyPhone.toString().trim() : '',
+            seoDescription: seoDescription ? seoDescription.toString().trim() : '',
+            technologies: technologies ? technologies.toString().trim() : '',
+            annualRevenue: annualRevenue ? annualRevenue.toString().trim() : ''
           });
         });
       } catch (excelError) {
@@ -1021,40 +1059,78 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               normalizedRow[key.toLowerCase().trim()] = row[key];
             });
 
-            // Get values with case-insensitive matching
+            // Get values with case-insensitive matching for all fields
             const name = normalizedRow['name'] || '';
             const email = normalizedRow['email'] || '';
             const company = normalizedRow['company'] || '';
-            const phone = normalizedRow['phone'] || '';
             const title = normalizedRow['title'] || '';
-            // Support multiple LinkedIn column name variations
-            const linkedinUrl = normalizedRow['linkedin'] || 
-                                normalizedRow['linkedinurl'] || 
-                                normalizedRow['linkedin url'] || 
-                                normalizedRow['personlinkedinurl'] || 
-                                normalizedRow['person linkedin url'] || 
-                                normalizedRow['linkedin profile'] || 
-                                normalizedRow['linkedinprofile'] || '';
+            const firstPhone = normalizedRow['first phone'] || normalizedRow['firstphone'] || normalizedRow['phone'] || '';
+            const employees = normalizedRow['employees'] || '';
+            const category = normalizedRow['category'] || '';
+            const industry = normalizedRow['industry'] || '';
+            const keywords = normalizedRow['keywords'] || '';
+            const personLinkedinUrl = normalizedRow['person linkedin url'] || normalizedRow['personlinkedinurl'] || 
+                                     normalizedRow['linkedin'] || normalizedRow['linkedinurl'] || 
+                                     normalizedRow['linkedin url'] || normalizedRow['linkedin profile'] || 
+                                     normalizedRow['linkedinprofile'] || '';
+            const website = normalizedRow['website'] || '';
+            const companyLinkedinUrl = normalizedRow['company linkedin url'] || normalizedRow['companylinkedinurl'] || '';
+            const facebookUrl = normalizedRow['facebook url'] || normalizedRow['facebookurl'] || '';
+            const twitterUrl = normalizedRow['twitter url'] || normalizedRow['twitterurl'] || '';
+            const city = normalizedRow['city'] || '';
+            const state = normalizedRow['state'] || '';
+            const country = normalizedRow['country'] || '';
+            const companyAddress = normalizedRow['company address'] || normalizedRow['companyaddress'] || '';
+            const companyCity = normalizedRow['company city'] || normalizedRow['companycity'] || '';
+            const companyState = normalizedRow['company state'] || normalizedRow['companystate'] || '';
+            const companyCountry = normalizedRow['company country'] || normalizedRow['companycountry'] || '';
+            const companyPhone = normalizedRow['company phone'] || normalizedRow['companyphone'] || '';
+            const seoDescription = normalizedRow['seo description'] || normalizedRow['seodescription'] || '';
+            const technologies = normalizedRow['technologies'] || '';
+            const annualRevenue = normalizedRow['annual revenue'] || normalizedRow['annualrevenue'] || '';
 
             // Skip completely empty rows
-            const hasAnyData = name || email || company || phone || title || linkedinUrl;
+            const hasAnyData = name || email || company || title || firstPhone || employees || category || 
+                             industry || keywords || personLinkedinUrl || website || companyLinkedinUrl || 
+                             facebookUrl || twitterUrl || city || state || country || companyAddress || 
+                             companyCity || companyState || companyCountry || companyPhone || seoDescription || 
+                             technologies || annualRevenue;
             if (!hasAnyData) {
               return; // Skip empty rows silently
             }
 
-            // Generate default values for missing fields (no validation)
+            // Generate default values for required fields (no validation)
             const trimmedName = name ? name.trim() : `Contact ${rowNumber}`;
             let trimmedEmail = email ? email.trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
             const trimmedCompany = company ? company.trim() : 'Unknown Company';
 
-            // Create contact object (accept any data, no validation)
+            // Create contact object with all fields (accept any data, no validation)
             contacts.push({
               name: trimmedName,
               email: trimmedEmail,
               company: trimmedCompany,
-              firstPhone: phone ? phone.trim() : '',
               title: title ? title.trim() : '',
-              personLinkedinUrl: linkedinUrl ? linkedinUrl.trim() : ''
+              firstPhone: firstPhone ? firstPhone.trim() : '',
+              employees: employees ? employees.trim() : '',
+              category: category ? category.trim() : '',
+              industry: industry ? industry.trim() : '',
+              keywords: keywords ? keywords.trim() : '',
+              personLinkedinUrl: personLinkedinUrl ? personLinkedinUrl.trim() : '',
+              website: website ? website.trim() : '',
+              companyLinkedinUrl: companyLinkedinUrl ? companyLinkedinUrl.trim() : '',
+              facebookUrl: facebookUrl ? facebookUrl.trim() : '',
+              twitterUrl: twitterUrl ? twitterUrl.trim() : '',
+              city: city ? city.trim() : '',
+              state: state ? state.trim() : '',
+              country: country ? country.trim() : '',
+              companyAddress: companyAddress ? companyAddress.trim() : '',
+              companyCity: companyCity ? companyCity.trim() : '',
+              companyState: companyState ? companyState.trim() : '',
+              companyCountry: companyCountry ? companyCountry.trim() : '',
+              companyPhone: companyPhone ? companyPhone.trim() : '',
+              seoDescription: seoDescription ? seoDescription.trim() : '',
+              technologies: technologies ? technologies.trim() : '',
+              annualRevenue: annualRevenue ? annualRevenue.trim() : ''
             });
           })
           .on('end', resolve)
@@ -1264,14 +1340,71 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             if (contact.company && contact.company.trim() !== '' && (!existingContact.company || existingContact.company.trim() === '')) {
               updateData.company = contact.company;
             }
-            if (contact.firstPhone && contact.firstPhone.trim() !== '' && (!existingContact.firstPhone || existingContact.firstPhone.trim() === '')) {
-              updateData.firstPhone = contact.firstPhone;
-            }
             if (contact.title && contact.title.trim() !== '' && (!existingContact.title || existingContact.title.trim() === '')) {
               updateData.title = contact.title;
             }
+            if (contact.firstPhone && contact.firstPhone.trim() !== '' && (!existingContact.firstPhone || existingContact.firstPhone.trim() === '')) {
+              updateData.firstPhone = contact.firstPhone;
+            }
+            if (contact.employees && contact.employees.trim() !== '' && (!existingContact.employees || existingContact.employees.trim() === '')) {
+              updateData.employees = contact.employees;
+            }
+            if (contact.category && contact.category.trim() !== '' && (!existingContact.category || existingContact.category.trim() === '')) {
+              updateData.category = contact.category;
+            }
+            if (contact.industry && contact.industry.trim() !== '' && (!existingContact.industry || existingContact.industry.trim() === '')) {
+              updateData.industry = contact.industry;
+            }
+            if (contact.keywords && contact.keywords.trim() !== '' && (!existingContact.keywords || existingContact.keywords.trim() === '')) {
+              updateData.keywords = contact.keywords;
+            }
             if (contact.personLinkedinUrl && contact.personLinkedinUrl.trim() !== '' && (!existingContact.personLinkedinUrl || existingContact.personLinkedinUrl.trim() === '')) {
               updateData.personLinkedinUrl = contact.personLinkedinUrl;
+            }
+            if (contact.website && contact.website.trim() !== '' && (!existingContact.website || existingContact.website.trim() === '')) {
+              updateData.website = contact.website;
+            }
+            if (contact.companyLinkedinUrl && contact.companyLinkedinUrl.trim() !== '' && (!existingContact.companyLinkedinUrl || existingContact.companyLinkedinUrl.trim() === '')) {
+              updateData.companyLinkedinUrl = contact.companyLinkedinUrl;
+            }
+            if (contact.facebookUrl && contact.facebookUrl.trim() !== '' && (!existingContact.facebookUrl || existingContact.facebookUrl.trim() === '')) {
+              updateData.facebookUrl = contact.facebookUrl;
+            }
+            if (contact.twitterUrl && contact.twitterUrl.trim() !== '' && (!existingContact.twitterUrl || existingContact.twitterUrl.trim() === '')) {
+              updateData.twitterUrl = contact.twitterUrl;
+            }
+            if (contact.city && contact.city.trim() !== '' && (!existingContact.city || existingContact.city.trim() === '')) {
+              updateData.city = contact.city;
+            }
+            if (contact.state && contact.state.trim() !== '' && (!existingContact.state || existingContact.state.trim() === '')) {
+              updateData.state = contact.state;
+            }
+            if (contact.country && contact.country.trim() !== '' && (!existingContact.country || existingContact.country.trim() === '')) {
+              updateData.country = contact.country;
+            }
+            if (contact.companyAddress && contact.companyAddress.trim() !== '' && (!existingContact.companyAddress || existingContact.companyAddress.trim() === '')) {
+              updateData.companyAddress = contact.companyAddress;
+            }
+            if (contact.companyCity && contact.companyCity.trim() !== '' && (!existingContact.companyCity || existingContact.companyCity.trim() === '')) {
+              updateData.companyCity = contact.companyCity;
+            }
+            if (contact.companyState && contact.companyState.trim() !== '' && (!existingContact.companyState || existingContact.companyState.trim() === '')) {
+              updateData.companyState = contact.companyState;
+            }
+            if (contact.companyCountry && contact.companyCountry.trim() !== '' && (!existingContact.companyCountry || existingContact.companyCountry.trim() === '')) {
+              updateData.companyCountry = contact.companyCountry;
+            }
+            if (contact.companyPhone && contact.companyPhone.trim() !== '' && (!existingContact.companyPhone || existingContact.companyPhone.trim() === '')) {
+              updateData.companyPhone = contact.companyPhone;
+            }
+            if (contact.seoDescription && contact.seoDescription.trim() !== '' && (!existingContact.seoDescription || existingContact.seoDescription.trim() === '')) {
+              updateData.seoDescription = contact.seoDescription;
+            }
+            if (contact.technologies && contact.technologies.trim() !== '' && (!existingContact.technologies || existingContact.technologies.trim() === '')) {
+              updateData.technologies = contact.technologies;
+            }
+            if (contact.annualRevenue && contact.annualRevenue.trim() !== '' && (!existingContact.annualRevenue || existingContact.annualRevenue.trim() === '')) {
+              updateData.annualRevenue = contact.annualRevenue;
             }
             
             // Update if there are any fields to update

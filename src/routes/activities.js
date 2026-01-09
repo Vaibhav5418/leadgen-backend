@@ -124,7 +124,7 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
     const activities = await Activity.find({ projectId: req.params.projectId })
-      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt')
+      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt lnRequestSent connected linkedInAccountName callNumber callStatus callDate')
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
@@ -184,6 +184,123 @@ router.get('/:id', authenticate, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch activity'
+    });
+  }
+});
+
+// Update an activity
+router.put('/:id', authenticate, async (req, res) => {
+  try {
+    const {
+      template,
+      conversationNotes,
+      nextAction,
+      nextActionDate,
+      phoneNumber,
+      email,
+      linkedInUrl,
+      status,
+      linkedInAccountName,
+      lnRequestSent,
+      connected,
+      callNumber,
+      callStatus,
+      callDate
+    } = req.body;
+
+    const activity = await Activity.findById(req.params.id);
+
+    if (!activity) {
+      return res.status(404).json({
+        success: false,
+        error: 'Activity not found'
+      });
+    }
+
+    // Validate next action date is within 7 days (if provided)
+    let selectedDate = null;
+    if (nextActionDate) {
+      selectedDate = new Date(nextActionDate);
+      const today = new Date();
+      const maxDate = new Date(today);
+      maxDate.setDate(maxDate.getDate() + 7);
+
+      if (selectedDate > maxDate) {
+        return res.status(400).json({
+          success: false,
+          error: 'Next action must be scheduled within 7 days'
+        });
+      }
+    }
+
+    // Update fields
+    if (template !== undefined) activity.template = template || '';
+    if (conversationNotes !== undefined) activity.conversationNotes = conversationNotes ? conversationNotes.trim() : '';
+    if (nextAction !== undefined) activity.nextAction = nextAction || null;
+    if (nextActionDate !== undefined) activity.nextActionDate = selectedDate || null;
+    if (phoneNumber !== undefined) activity.phoneNumber = phoneNumber || null;
+    if (email !== undefined) activity.email = email || null;
+    if (linkedInUrl !== undefined) activity.linkedInUrl = linkedInUrl || null;
+    if (status !== undefined) activity.status = status || null;
+    if (linkedInAccountName !== undefined) activity.linkedInAccountName = linkedInAccountName || null;
+    if (lnRequestSent !== undefined) activity.lnRequestSent = lnRequestSent || null;
+    if (connected !== undefined) activity.connected = connected || null;
+    if (callNumber !== undefined) activity.callNumber = callNumber || null;
+    if (callStatus !== undefined) activity.callStatus = callStatus || null;
+    if (callDate !== undefined) activity.callDate = callDate ? new Date(callDate) : null;
+
+    await activity.save();
+
+    console.log(`✓ Activity updated in database:`, {
+      id: activity._id,
+      type: activity.type,
+      callNumber: activity.callNumber || null,
+      callStatus: activity.callStatus || null,
+      callDate: activity.callDate || null
+    });
+
+    res.json({
+      success: true,
+      data: activity,
+      message: 'Activity updated successfully'
+    });
+  } catch (error) {
+    console.error('Error updating activity:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update activity'
+    });
+  }
+});
+
+// Delete an activity
+router.delete('/:id', authenticate, async (req, res) => {
+  try {
+    const activity = await Activity.findById(req.params.id);
+
+    if (!activity) {
+      return res.status(404).json({
+        success: false,
+        error: 'Activity not found'
+      });
+    }
+
+    await Activity.findByIdAndDelete(req.params.id);
+
+    console.log(`✓ Activity deleted from database:`, {
+      id: activity._id,
+      type: activity.type
+    });
+
+    res.json({
+      success: true,
+      message: 'Activity deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting activity:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to delete activity'
     });
   }
 });
