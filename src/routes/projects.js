@@ -13,9 +13,7 @@ const authenticate = require('../middleware/auth');
 // Configure multer for file uploads
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB
-  },
+  // No file size limit - allow any size (removed limits object)
   fileFilter: (req, file, cb) => {
     const fileName = file.originalname.toLowerCase();
     const allowedExtensions = ['.csv', '.xlsx', '.xls'];
@@ -137,7 +135,7 @@ router.post('/', authenticate, async (req, res) => {
 router.get('/', authenticate, async (req, res) => {
   try {
     const { search, status } = req.query;
-    let filter = { createdBy: req.user._id };
+    let filter = {}; // Show all projects created by any user
 
     if (status) {
       filter.status = status;
@@ -241,8 +239,7 @@ router.get('/', authenticate, async (req, res) => {
 router.get('/:id', authenticate, async (req, res) => {
   try {
     const project = await Project.findOne({
-      _id: req.params.id,
-      createdBy: req.user._id
+      _id: req.params.id
     }).lean();
 
     if (!project) {
@@ -348,8 +345,7 @@ const calculateMatchScore = (contact, icpDefinition) => {
 router.get('/:id/project-contacts', authenticate, async (req, res) => {
   try {
     const project = await Project.findOne({
-      _id: req.params.id,
-      createdBy: req.user._id
+      _id: req.params.id
     }).lean();
 
     if (!project) {
@@ -396,8 +392,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
 router.get('/:id/similar-contacts', authenticate, async (req, res) => {
   try {
     const project = await Project.findOne({
-      _id: req.params.id,
-      createdBy: req.user._id
+      _id: req.params.id
     }).lean();
 
     if (!project) {
@@ -808,10 +803,9 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       });
     }
 
-    // Verify project exists and user has access
+    // Verify project exists
     const project = await Project.findOne({
-      _id: projectId,
-      createdBy: req.user._id
+      _id: projectId
     });
 
     if (!project) {
@@ -859,32 +853,22 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
                               normalizedRow['linkedin profile'] || 
                               normalizedRow['linkedinprofile'] || '';
 
-          // Validate required fields
-          if (!name || !email || !company) {
-            errors.push({
-              row: rowNumber,
-              error: 'Missing required fields (Name, Email, Company)'
-            });
-            return;
+          // Skip completely empty rows
+          const hasAnyData = name || email || company || phone || title || linkedinUrl;
+          if (!hasAnyData) {
+            return; // Skip empty rows silently
           }
 
-          // Validate email format
-          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-          const trimmedEmail = email.toString().trim().toLowerCase();
-          if (!emailRegex.test(trimmedEmail)) {
-            errors.push({
-              row: rowNumber,
-              email: trimmedEmail,
-              error: 'Invalid email format'
-            });
-            return;
-          }
+          // Generate default values for missing fields (no validation)
+          const trimmedName = name ? name.toString().trim() : `Contact ${rowNumber}`;
+          let trimmedEmail = email ? email.toString().trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
+          const trimmedCompany = company ? company.toString().trim() : 'Unknown Company';
 
-          // Create contact object
+          // Create contact object (accept any data, no validation)
           contacts.push({
-            name: name.toString().trim(),
+            name: trimmedName,
             email: trimmedEmail,
-            company: company.toString().trim(),
+            company: trimmedCompany,
             firstPhone: phone ? phone.toString().trim() : '',
             title: title ? title.toString().trim() : '',
             personLinkedinUrl: linkedinUrl ? linkedinUrl.toString().trim() : ''
@@ -929,32 +913,22 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
                                 normalizedRow['linkedin profile'] || 
                                 normalizedRow['linkedinprofile'] || '';
 
-            // Validate required fields
-            if (!name || !email || !company) {
-              errors.push({
-                row: rowNumber,
-                error: 'Missing required fields (Name, Email, Company)'
-              });
-              return;
+            // Skip completely empty rows
+            const hasAnyData = name || email || company || phone || title || linkedinUrl;
+            if (!hasAnyData) {
+              return; // Skip empty rows silently
             }
 
-            // Validate email format
-            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-            const trimmedEmail = email.trim().toLowerCase();
-            if (!emailRegex.test(trimmedEmail)) {
-              errors.push({
-                row: rowNumber,
-                email: trimmedEmail,
-                error: 'Invalid email format'
-              });
-              return;
-            }
+            // Generate default values for missing fields (no validation)
+            const trimmedName = name ? name.trim() : `Contact ${rowNumber}`;
+            let trimmedEmail = email ? email.trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
+            const trimmedCompany = company ? company.trim() : 'Unknown Company';
 
-            // Create contact object
+            // Create contact object (accept any data, no validation)
             contacts.push({
-              name: name.trim(),
+              name: trimmedName,
               email: trimmedEmail,
-              company: company.trim(),
+              company: trimmedCompany,
               firstPhone: phone ? phone.trim() : '',
               title: title ? title.trim() : '',
               personLinkedinUrl: linkedinUrl ? linkedinUrl.trim() : ''
@@ -968,23 +942,34 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
     if (contacts.length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'No valid contacts found in CSV file'
+        error: 'No contacts found in file. Please ensure the file contains data.'
       });
     }
 
-    // Check for duplicate emails in the CSV
+    // Handle duplicate emails in the CSV by making them unique
     const emailSet = new Set();
-    const duplicatesInCSV = [];
-    contacts.forEach((contact, index) => {
-      if (emailSet.has(contact.email)) {
-        duplicatesInCSV.push(index);
-      } else {
-        emailSet.add(contact.email);
+    const uniqueContacts = contacts.map((contact, index) => {
+      let email = contact.email;
+      let counter = 1;
+      
+      // If email already exists, make it unique by appending a number
+      while (emailSet.has(email)) {
+        const baseEmail = contact.email.includes('@') 
+          ? contact.email.split('@')[0] 
+          : `contact${index}`;
+        const domain = contact.email.includes('@') 
+          ? contact.email.split('@')[1] 
+          : 'unknown.com';
+        email = `${baseEmail}${counter}@${domain}`;
+        counter++;
       }
+      
+      emailSet.add(email);
+      return {
+        ...contact,
+        email: email
+      };
     });
-
-    // Remove duplicates from CSV
-    const uniqueContacts = contacts.filter((_, index) => !duplicatesInCSV.includes(index));
 
     // Check for existing contacts in database (case-insensitive email matching)
     const emailsToCheck = uniqueContacts.map(c => c.email.toLowerCase());
