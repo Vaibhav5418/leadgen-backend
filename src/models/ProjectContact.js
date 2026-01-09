@@ -15,7 +15,27 @@ const projectContactSchema = new mongoose.Schema({
   },
   stage: {
     type: String,
-    enum: ['New', 'Contacted', 'Qualified', 'Proposal', 'Negotiation'],
+    enum: [
+      'CIP',
+      'No Reply',
+      'Not Interested',
+      'Meeting Proposed',
+      'Meeting Scheduled',
+      'In-Person Meeting',
+      'Meeting Completed',
+      'SQL',
+      'Tech Discussion',
+      'WON',
+      'Lost',
+      'Low Potential - Open',
+      'Potential Future',
+      // Legacy stages for backward compatibility
+      'New',
+      'Contacted',
+      'Qualified',
+      'Proposal',
+      'Negotiation'
+    ],
     default: 'New'
   },
   assignedTo: {

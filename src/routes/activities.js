@@ -8,16 +8,25 @@ router.post('/', authenticate, async (req, res) => {
   try {
     const {
       projectId,
+      contactId,
       type,
       template,
       outcome,
       conversationNotes,
       nextAction,
-      nextActionDate
+      nextActionDate,
+      phoneNumber,
+      email,
+      linkedInUrl,
+      status,
+      linkedInAccountName,
+      callNumber,
+      callStatus,
+      callDate
     } = req.body;
 
-    // Validate required fields
-    if (!projectId || !type || !outcome || !conversationNotes || !nextAction || !nextActionDate) {
+    // Validate required fields (conversationNotes is now optional)
+    if (!projectId || !type || !outcome || !nextAction || !nextActionDate) {
       return res.status(400).json({
         success: false,
         error: 'All required fields must be provided'
@@ -25,12 +34,7 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     // Validate conversation notes length
-    if (conversationNotes.trim().length < 50) {
-      return res.status(400).json({
-        success: false,
-        error: 'Conversation notes must be at least 50 characters'
-      });
-    }
+    // Conversation Notes is now optional - no minimum length validation
 
     // Validate next action date is within 7 days
     const selectedDate = new Date(nextActionDate);
@@ -47,12 +51,21 @@ router.post('/', authenticate, async (req, res) => {
 
     const activity = new Activity({
       projectId,
+      contactId: contactId || null,
       type,
       template: template || '',
       outcome,
-      conversationNotes: conversationNotes.trim(),
+      conversationNotes: conversationNotes ? conversationNotes.trim() : '',
       nextAction,
       nextActionDate: selectedDate,
+      phoneNumber: phoneNumber || null,
+      email: email || null,
+      linkedInUrl: linkedInUrl || null,
+      status: status || null,
+      linkedInAccountName: linkedInAccountName || null,
+      callNumber: callNumber || null,
+      callStatus: callStatus || null,
+      callDate: callDate ? new Date(callDate) : null,
       createdBy: req.user._id
     });
 
@@ -63,6 +76,9 @@ router.post('/', authenticate, async (req, res) => {
       type: activity.type,
       projectId: activity.projectId,
       outcome: activity.outcome,
+      callNumber: activity.callNumber || null,
+      callStatus: activity.callStatus || null,
+      callDate: activity.callDate || null,
       createdAt: activity.createdAt
     });
 
@@ -83,8 +99,11 @@ router.post('/', authenticate, async (req, res) => {
 // Get all activities for a project
 router.get('/project/:projectId', authenticate, async (req, res) => {
   try {
+    const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
     const activities = await Activity.find({ projectId: req.params.projectId })
+      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt')
       .sort({ createdAt: -1 })
+      .limit(limit)
       .lean();
 
     res.json({
@@ -96,6 +115,27 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch activities'
+    });
+  }
+});
+
+// Get all activities for a contact
+router.get('/contact/:contactId', authenticate, async (req, res) => {
+  try {
+    const activities = await Activity.find({ contactId: req.params.contactId })
+      .populate('projectId', 'companyName')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.json({
+      success: true,
+      data: activities
+    });
+  } catch (error) {
+    console.error('Error fetching contact activities:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch contact activities'
     });
   }
 });

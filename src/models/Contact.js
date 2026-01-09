@@ -145,5 +145,7 @@ contactSchema.index({ title: 1 }); // For title-based queries
 contactSchema.index({ firstPhone: 1 }); // For phone validation queries
 contactSchema.index({ email: 1, title: 1, company: 1 }); // Compound index for outreach ready queries
 contactSchema.index({ state: 1, country: 1 }); // Compound index for geographic queries
+contactSchema.index({ industry: 1, title: 1 }); // Compound index for ICP matching
+contactSchema.index({ keywords: 1 }); // Index for keyword searches
 
 module.exports = mongoose.model('Contact', contactSchema);

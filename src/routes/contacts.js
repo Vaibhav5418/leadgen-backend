@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Contact = require('../models/Contact');
+const authenticate = require('../middleware/auth');
 
 // Helper function to check for duplicates
 async function checkDuplicate(contactData) {
@@ -922,7 +923,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // Update contact
-router.put('/:id', async (req, res) => {
+router.put('/:id', authenticate, async (req, res) => {
   try {
     const contact = await Contact.findByIdAndUpdate(
       req.params.id,

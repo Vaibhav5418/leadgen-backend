@@ -152,8 +152,77 @@ router.get('/', authenticate, async (req, res) => {
     }
 
     const projects = await Project.find(filter)
+      .populate('createdBy', 'name email')
       .sort({ createdAt: -1 })
       .lean();
+    
+    // Manually populate createdBy if it's still an ObjectId (lean() sometimes doesn't populate correctly)
+    const User = require('../models/User');
+    const mongoose = require('mongoose');
+    
+    // Extract user IDs properly - handle both populated and unpopulated cases
+    const userIdsToFetch = [];
+    
+    projects.forEach(project => {
+      if (project.createdBy) {
+        // Check if already populated (has name or email property)
+        if (project.createdBy.name || project.createdBy.email) {
+          // Already populated, skip
+          return;
+        }
+        
+        // Try to extract the ObjectId
+        let userId = null;
+        if (typeof project.createdBy === 'string') {
+          // It's a string ObjectId
+          if (mongoose.Types.ObjectId.isValid(project.createdBy)) {
+            userId = project.createdBy;
+          }
+        } else if (project.createdBy._id) {
+          // It's an object with _id property
+          userId = project.createdBy._id.toString();
+        } else if (mongoose.Types.ObjectId.isValid(project.createdBy)) {
+          // It's an ObjectId object
+          userId = project.createdBy.toString();
+        }
+        
+        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+          userIdsToFetch.push(userId);
+        }
+      }
+    });
+    
+    // Fetch users if we have any unpopulated createdBy fields
+    if (userIdsToFetch.length > 0) {
+      const uniqueUserIds = [...new Set(userIdsToFetch)];
+      const users = await User.find({ _id: { $in: uniqueUserIds } }).select('name email').lean();
+      const userMap = new Map(users.map(u => [u._id.toString(), { name: u.name, email: u.email }]));
+      
+      // Update projects with user data
+      projects.forEach(project => {
+        if (project.createdBy && !project.createdBy.name && !project.createdBy.email) {
+          // Not populated yet, try to populate
+          let userId = null;
+          if (typeof project.createdBy === 'string') {
+            userId = project.createdBy;
+          } else if (project.createdBy._id) {
+            userId = project.createdBy._id.toString();
+          } else if (mongoose.Types.ObjectId.isValid(project.createdBy)) {
+            userId = project.createdBy.toString();
+          }
+          
+          if (userId) {
+            const user = userMap.get(userId);
+            if (user) {
+              project.createdBy = user;
+            } else {
+              // User not found, keep the ObjectId or set to null
+              project.createdBy = null;
+            }
+          }
+        }
+      });
+    }
 
     res.json({
       success: true,
@@ -196,6 +265,133 @@ router.get('/:id', authenticate, async (req, res) => {
   }
 });
 
+// Helper function to parse company size from employees string
+const parseCompanySize = (employeesStr) => {
+  if (!employeesStr) return null;
+  const str = employeesStr.toString().toLowerCase();
+  // Extract numbers
+  const numbers = str.match(/\d+/g);
+  if (!numbers || numbers.length === 0) return null;
+  
+  // Try to get the largest number (usually the max)
+  const maxNum = Math.max(...numbers.map(n => parseInt(n)));
+  return maxNum;
+};
+
+// Helper function to calculate ICP match score
+const calculateMatchScore = (contact, icpDefinition) => {
+  let score = 0;
+  let maxScore = 0;
+
+  // Industry match (30 points)
+  if (icpDefinition?.targetIndustries && icpDefinition.targetIndustries.length > 0) {
+    maxScore += 30;
+    const contactIndustry = (contact.industry || '').toLowerCase();
+    if (icpDefinition.targetIndustries.some(ind => 
+      contactIndustry.includes(ind.toLowerCase()) || ind.toLowerCase().includes(contactIndustry)
+    )) {
+      score += 30;
+    }
+  }
+
+  // Job title match (25 points)
+  if (icpDefinition?.targetJobTitles && icpDefinition.targetJobTitles.length > 0) {
+    maxScore += 25;
+    const contactTitle = (contact.title || '').toLowerCase();
+    if (icpDefinition.targetJobTitles.some(jt => 
+      contactTitle.includes(jt.toLowerCase()) || jt.toLowerCase().includes(contactTitle)
+    )) {
+      score += 25;
+    }
+  }
+
+  // Company size match (20 points)
+  if (icpDefinition?.companySizeMin !== undefined && icpDefinition?.companySizeMax !== undefined) {
+    maxScore += 20;
+    const companySize = parseCompanySize(contact.employees);
+    if (companySize && companySize >= icpDefinition.companySizeMin && companySize <= icpDefinition.companySizeMax) {
+      score += 20;
+    }
+  }
+
+  // Geography match (15 points)
+  if (icpDefinition?.geographies && icpDefinition.geographies.length > 0) {
+    maxScore += 15;
+    const contactLocation = [
+      contact.city, contact.state, contact.country,
+      contact.companyCity, contact.companyState, contact.companyCountry
+    ].filter(Boolean).join(' ').toLowerCase();
+    
+    if (icpDefinition.geographies.some(geo => 
+      contactLocation.includes(geo.toLowerCase())
+    )) {
+      score += 15;
+    }
+  }
+
+  // Keywords match (10 points)
+  if (icpDefinition?.keywords && icpDefinition.keywords.length > 0) {
+    maxScore += 10;
+    const contactKeywords = (contact.keywords || '').toLowerCase();
+    const matchedKeywords = icpDefinition.keywords.filter(kw => 
+      contactKeywords.includes(kw.toLowerCase())
+    );
+    if (matchedKeywords.length > 0) {
+      score += Math.min(10, (matchedKeywords.length / icpDefinition.keywords.length) * 10);
+    }
+  }
+
+  return { score, maxScore, percentage: maxScore > 0 ? (score / maxScore) * 100 : 0 };
+};
+
+// Get imported contacts for a project (only contacts already linked to project)
+router.get('/:id/project-contacts', authenticate, async (req, res) => {
+  try {
+    const project = await Project.findOne({
+      _id: req.params.id,
+      createdBy: req.user._id
+    }).lean();
+
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    // Get imported contacts for this project
+    const importedProjectContacts = await ProjectContact.find({ projectId: project._id })
+      .populate('contactId', 'name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
+      .lean();
+
+    // Format contacts
+    const contacts = importedProjectContacts
+      .filter(pc => pc.contactId && pc.contactId._id)
+      .map(pc => {
+        const contact = { ...pc.contactId };
+        contact._id = pc.contactId._id;
+        contact.projectContactId = pc._id;
+        contact.stage = pc.stage || 'New';
+        contact.assignedTo = pc.assignedTo || '';
+        contact.priority = pc.priority || 'Medium';
+        contact.isImported = true;
+        contact.matchType = 'imported';
+        return contact;
+      });
+
+    res.json({
+      success: true,
+      data: contacts
+    });
+  } catch (error) {
+    console.error('Error fetching project contacts:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch project contacts'
+    });
+  }
+});
+
 // Get similar contacts for a project
 router.get('/:id/similar-contacts', authenticate, async (req, res) => {
   try {
@@ -211,75 +407,76 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       });
     }
 
-    // Build query to find similar contacts based on project data
-    let contactFilter = {};
+    const icpDefinition = project.icpDefinition || {};
 
-    // Match by industry if available
-    if (project.industry) {
-      contactFilter.industry = { $regex: project.industry, $options: 'i' };
-    }
+    // Build query to find similar contacts based on ICP criteria
+    let contactFilter = {};
+    const orConditions = [];
 
     // Match by ICP target industries
-    if (project.icpDefinition?.targetIndustries && project.icpDefinition.targetIndustries.length > 0) {
-      const industryRegex = project.icpDefinition.targetIndustries.map(ind => 
+    if (icpDefinition.targetIndustries && icpDefinition.targetIndustries.length > 0) {
+      const industryRegex = icpDefinition.targetIndustries.map(ind => 
         new RegExp(ind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
       );
-      contactFilter.$or = [
-        ...(contactFilter.$or || []),
-        { industry: { $in: industryRegex } }
-      ];
+      orConditions.push({ industry: { $in: industryRegex } });
+    } else if (project.industry) {
+      // Fallback to project industry if no ICP industries defined
+      orConditions.push({ industry: { $regex: project.industry, $options: 'i' } });
     }
 
-    // Match by company name similarity (exclude the project's company)
-    if (project.companyName) {
-      const companyWords = project.companyName.split(/\s+/).filter(w => w.length > 2);
-      if (companyWords.length > 0) {
-        const companyRegex = companyWords.map(word => 
-          new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
-        );
-        contactFilter.$or = [
-          ...(contactFilter.$or || []),
-          { company: { $in: companyRegex } }
-        ];
-      }
-    }
-
-    // Match by keywords from ICP
-    if (project.icpDefinition?.keywords && project.icpDefinition.keywords.length > 0) {
-      const keywordRegex = project.icpDefinition.keywords.map(kw => 
-        new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+    // Match by ICP target job titles
+    if (icpDefinition.targetJobTitles && icpDefinition.targetJobTitles.length > 0) {
+      const titleRegex = icpDefinition.targetJobTitles.map(jt => 
+        new RegExp(jt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
       );
-      contactFilter.$or = [
-        ...(contactFilter.$or || []),
-        { keywords: { $in: keywordRegex } }
-      ];
+      orConditions.push({ title: { $in: titleRegex } });
     }
 
-    // Match by geography (city, country)
-    if (project.city || project.country) {
-      const geoFilter = {};
+    // Match by ICP geographies
+    if (icpDefinition.geographies && icpDefinition.geographies.length > 0) {
+      const geoConditions = [];
+      icpDefinition.geographies.forEach(geo => {
+        const geoRegex = new RegExp(geo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        geoConditions.push(
+          { city: geoRegex },
+          { state: geoRegex },
+          { country: geoRegex },
+          { companyCity: geoRegex },
+          { companyState: geoRegex },
+          { companyCountry: geoRegex }
+        );
+      });
+      orConditions.push({ $or: geoConditions });
+    } else if (project.city || project.country) {
+      // Fallback to project location
+      const geoConditions = [];
       if (project.city) {
-        geoFilter.$or = [
-          { city: { $regex: project.city, $options: 'i' } },
-          { companyCity: { $regex: project.city, $options: 'i' } }
-        ];
+        const cityRegex = new RegExp(project.city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        geoConditions.push({ city: cityRegex }, { companyCity: cityRegex });
       }
       if (project.country) {
-        geoFilter.$or = [
-          ...(geoFilter.$or || []),
-          { country: { $regex: project.country, $options: 'i' } },
-          { companyCountry: { $regex: project.country, $options: 'i' } }
-        ];
+        const countryRegex = new RegExp(project.country.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        geoConditions.push({ country: countryRegex }, { companyCountry: countryRegex });
       }
-      if (Object.keys(geoFilter).length > 0) {
-        contactFilter.$or = [
-          ...(contactFilter.$or || []),
-          geoFilter
-        ];
+      if (geoConditions.length > 0) {
+        orConditions.push({ $or: geoConditions });
       }
     }
 
-    // If no specific filters, get all contacts (fallback)
+    // Match by ICP keywords
+    if (icpDefinition.keywords && icpDefinition.keywords.length > 0) {
+      const keywordRegex = icpDefinition.keywords.map(kw => 
+        new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+      );
+      orConditions.push({ keywords: { $in: keywordRegex } });
+    }
+
+    // Combine all OR conditions
+    if (orConditions.length > 0) {
+      contactFilter.$or = orConditions;
+    }
+
+    // If no ICP criteria, get all contacts (fallback)
     if (Object.keys(contactFilter).length === 0) {
       contactFilter = {};
     }
@@ -287,6 +484,22 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
     // Exclude the project's contact person if they exist in the database
     if (project.contactPerson?.email) {
       contactFilter.email = { $ne: project.contactPerson.email };
+    }
+
+    // Apply exclusion criteria
+    if (icpDefinition.exclusionCriteria && icpDefinition.exclusionCriteria.length > 0) {
+      const exclusionConditions = [];
+      icpDefinition.exclusionCriteria.forEach(exclusion => {
+        const exclusionRegex = new RegExp(exclusion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        exclusionConditions.push(
+          { industry: exclusionRegex },
+          { company: exclusionRegex },
+          { keywords: exclusionRegex }
+        );
+      });
+      if (exclusionConditions.length > 0) {
+        contactFilter.$nor = exclusionConditions;
+      }
     }
 
     // Get imported contacts for this project (these should always be shown)
@@ -316,13 +529,17 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       contactFilter._id = { $nin: Array.from(importedContactIds).map(id => new mongoose.Types.ObjectId(id)) };
     }
 
+    // Limit contacts to improve performance - fetch only top matches
+    const limit = parseInt(req.query.limit) || 500; // Default to 500, allow override
+    
     // Get similar contacts from databank (excluding already imported ones)
+    // Use lean() for better performance and limit results
     const similarContacts = await Contact.find(contactFilter)
-      .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website')
-      .limit(1000)
+      .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
+      .limit(limit)
       .lean();
 
-    // Start with imported contacts (these are priority)
+    // Start with imported contacts (these are priority and always shown)
     const allContacts = importedProjectContacts
       .filter(pc => pc.contactId && pc.contactId._id)
       .map(pc => {
@@ -332,29 +549,94 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
         contact.stage = pc.stage || 'New';
         contact.assignedTo = pc.assignedTo || '';
         contact.priority = pc.priority || 'Medium';
+        contact.isImported = true;
+        contact.matchType = 'imported';
+        contact.matchScore = 100; // Imported contacts have highest priority
         return contact;
       });
 
-    // Add similar contacts from databank (that aren't already imported)
-    similarContacts.forEach(contact => {
-      const contactId = contact._id.toString();
-      if (!importedContactIds.has(contactId)) {
-        // Check if this contact has project contact data (shouldn't happen, but just in case)
-        if (importedContactMap.has(contactId)) {
-          const projectContact = importedContactMap.get(contactId);
-          contact.stage = projectContact.stage;
-          contact.assignedTo = projectContact.assignedTo;
-          contact.priority = projectContact.priority;
-          contact.projectContactId = projectContact.projectContactId;
+    // Calculate match scores and add similar contacts from databank
+    // Use batch processing to avoid blocking
+    const scoredContacts = [];
+    const batchSize = 100;
+    
+    for (let i = 0; i < similarContacts.length; i += batchSize) {
+      const batch = similarContacts.slice(i, i + batchSize);
+      
+      for (const contact of batch) {
+        const contactId = contact._id.toString();
+        if (!importedContactIds.has(contactId)) {
+          // Calculate ICP match score
+          const matchResult = calculateMatchScore(contact, icpDefinition);
+          const matchPercentage = matchResult.percentage;
+          
+          // Determine match type
+          let matchType = 'similar';
+          if (matchPercentage >= 80) {
+            matchType = 'exact';
+          } else if (matchPercentage >= 50) {
+            matchType = 'good';
+          } else if (matchPercentage >= 30) {
+            matchType = 'similar';
+          } else {
+            matchType = 'loose';
+          }
+
+          contact.matchScore = Math.round(matchPercentage);
+          contact.matchType = matchType;
+          contact.isImported = false;
+          
+          // Check if this contact has project contact data (shouldn't happen, but just in case)
+          if (importedContactMap.has(contactId)) {
+            const projectContact = importedContactMap.get(contactId);
+            contact.stage = projectContact.stage;
+            contact.assignedTo = projectContact.assignedTo;
+            contact.priority = projectContact.priority;
+            contact.projectContactId = projectContact.projectContactId;
+          } else {
+            contact.stage = 'New';
+            contact.assignedTo = '';
+            contact.priority = 'Medium';
+          }
+
+          scoredContacts.push(contact);
         }
-        allContacts.push(contact);
       }
-    });
+      
+      // Yield to event loop every batch to prevent blocking
+      if (i + batchSize < similarContacts.length) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    }
+
+    // Sort by match score (exact matches first, then by score descending)
+    // Only sort if we have contacts to sort
+    if (scoredContacts.length > 0) {
+      scoredContacts.sort((a, b) => {
+        // Then by match type priority
+        const typeOrder = { 'exact': 0, 'good': 1, 'similar': 2, 'loose': 3, 'imported': -1 };
+        const typeDiff = (typeOrder[a.matchType] || 99) - (typeOrder[b.matchType] || 99);
+        if (typeDiff !== 0) return typeDiff;
+        
+        // Then by match score
+        return b.matchScore - a.matchScore;
+      });
+    }
+
+    // Combine imported and scored contacts
+    allContacts.push(...scoredContacts);
 
     res.json({
       success: true,
       data: allContacts,
-      count: allContacts.length
+      count: allContacts.length,
+      matchStats: {
+        exact: scoredContacts.filter(c => c.matchType === 'exact').length,
+        good: scoredContacts.filter(c => c.matchType === 'good').length,
+        similar: scoredContacts.filter(c => c.matchType === 'similar').length,
+        loose: scoredContacts.filter(c => c.matchType === 'loose').length,
+        imported: allContacts.filter(c => c.isImported).length
+      }
     });
   } catch (error) {
     console.error('Error fetching similar contacts:', error);
@@ -974,4 +1256,54 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
   }
 });
 
+// Update project-contact stage
+router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, res) => {
+  try {
+    const { projectId, contactId } = req.params;
+    const { stage, assignedTo, priority } = req.body;
+
+    // Find the project-contact link
+    const projectContact = await ProjectContact.findOne({
+      projectId: projectId,
+      contactId: contactId
+    });
+
+    if (!projectContact) {
+      // If doesn't exist, create it
+      const newProjectContact = new ProjectContact({
+        projectId: projectId,
+        contactId: contactId,
+        stage: stage || 'New',
+        assignedTo: assignedTo || '',
+        priority: priority || 'Medium',
+        createdBy: req.user._id
+      });
+      await newProjectContact.save();
+      return res.json({
+        success: true,
+        data: newProjectContact
+      });
+    }
+
+    // Update existing project-contact
+    if (stage) projectContact.stage = stage;
+    if (assignedTo !== undefined) projectContact.assignedTo = assignedTo;
+    if (priority) projectContact.priority = priority;
+
+    await projectContact.save();
+
+    res.json({
+      success: true,
+      data: projectContact
+    });
+  } catch (error) {
+    console.error('Error updating project-contact:', error);
+    res.status(400).json({
+      success: false,
+      error: error.message || 'Failed to update project-contact'
+    });
+  }
+});
+
 module.exports = router;
+
