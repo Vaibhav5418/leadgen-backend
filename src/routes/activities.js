@@ -24,7 +24,9 @@ router.post('/', authenticate, async (req, res) => {
       connected,
       callNumber,
       callStatus,
-      callDate
+      callDate,
+      emailDate,
+      linkedinDate
     } = req.body;
 
     // Validate required fields
@@ -89,6 +91,8 @@ router.post('/', authenticate, async (req, res) => {
       callNumber: callNumber || null,
       callStatus: callStatus || null,
       callDate: callDate ? new Date(callDate) : null,
+      emailDate: emailDate ? new Date(emailDate) : null,
+      linkedinDate: linkedinDate ? new Date(linkedinDate) : null,
       createdBy: req.user._id
     });
 
@@ -102,6 +106,8 @@ router.post('/', authenticate, async (req, res) => {
       callNumber: activity.callNumber || null,
       callStatus: activity.callStatus || null,
       callDate: activity.callDate || null,
+      emailDate: activity.emailDate || null,
+      linkedinDate: activity.linkedinDate || null,
       createdAt: activity.createdAt
     });
 
@@ -124,7 +130,7 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
     const activities = await Activity.find({ projectId: req.params.projectId })
-      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt lnRequestSent connected linkedInAccountName callNumber callStatus callDate')
+      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt lnRequestSent connected linkedInAccountName callNumber callStatus callDate emailDate linkedinDate')
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
@@ -205,7 +211,9 @@ router.put('/:id', authenticate, async (req, res) => {
       connected,
       callNumber,
       callStatus,
-      callDate
+      callDate,
+      emailDate,
+      linkedinDate
     } = req.body;
 
     const activity = await Activity.findById(req.params.id);
@@ -248,6 +256,8 @@ router.put('/:id', authenticate, async (req, res) => {
     if (callNumber !== undefined) activity.callNumber = callNumber || null;
     if (callStatus !== undefined) activity.callStatus = callStatus || null;
     if (callDate !== undefined) activity.callDate = callDate ? new Date(callDate) : null;
+    if (emailDate !== undefined) activity.emailDate = emailDate ? new Date(emailDate) : null;
+    if (linkedinDate !== undefined) activity.linkedinDate = linkedinDate ? new Date(linkedinDate) : null;
 
     await activity.save();
 
@@ -256,7 +266,9 @@ router.put('/:id', authenticate, async (req, res) => {
       type: activity.type,
       callNumber: activity.callNumber || null,
       callStatus: activity.callStatus || null,
-      callDate: activity.callDate || null
+      callDate: activity.callDate || null,
+      emailDate: activity.emailDate || null,
+      linkedinDate: activity.linkedinDate || null
     });
 
     res.json({

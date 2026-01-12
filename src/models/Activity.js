@@ -145,6 +145,16 @@ const activitySchema = new mongoose.Schema({
     required: false,
     default: null
   },
+  emailDate: {
+    type: Date,
+    required: false,
+    default: null
+  },
+  linkedinDate: {
+    type: Date,
+    required: false,
+    default: null
+  },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
