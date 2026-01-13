@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const Activity = require('../models/Activity');
 const ProspectContact = require('../models/ProspectContact');
 const Contact = require('../models/Contact');
+const ProjectContact = require('../models/ProjectContact');
 const authenticate = require('../middleware/auth');
 
 // Mongoose automatically pluralizes and lowercases: 'ProspectContact' -> 'prospectcontacts'
@@ -96,6 +97,43 @@ router.post('/', authenticate, async (req, res) => {
     });
 
     await activity.save();
+
+    // Update ProjectContact stage based on the most recent activity status
+    // Only update if the current activity has a status, or if we need to find the latest status
+    if (contactId && projectId) {
+      try {
+        // If the current activity has a status, use it to update the stage
+        if (status) {
+          await ProjectContact.findOneAndUpdate(
+            { projectId: projectId, contactId: contactId },
+            { stage: status },
+            { upsert: false } // Don't create if it doesn't exist
+          );
+        } else {
+          // If current activity doesn't have a status, find the most recent activity with a status
+          const mostRecentActivity = await Activity.findOne({
+            contactId: contactId,
+            projectId: projectId,
+            status: { $exists: true, $ne: null }
+          })
+            .sort({ createdAt: -1 })
+            .lean();
+
+          if (mostRecentActivity && mostRecentActivity.status) {
+            // Update ProjectContact stage to match the most recent activity status
+            await ProjectContact.findOneAndUpdate(
+              { projectId: projectId, contactId: contactId },
+              { stage: mostRecentActivity.status },
+              { upsert: false } // Don't create if it doesn't exist
+            );
+          }
+          // If no activity with status exists, don't update - keep existing stage or default to 'New'
+        }
+      } catch (updateError) {
+        // Log error but don't fail the activity creation
+        console.error('Error updating ProjectContact stage:', updateError);
+      }
+    }
 
     console.log(`✓ Activity saved to database:`, {
       id: activity._id,
@@ -352,6 +390,43 @@ router.put('/:id', authenticate, async (req, res) => {
     if (linkedinDate !== undefined) activity.linkedinDate = linkedinDate ? new Date(linkedinDate) : null;
 
     await activity.save();
+
+    // Update ProjectContact stage based on the most recent activity status
+    if (activity.contactId && activity.projectId) {
+      try {
+        // If the updated activity has a status, use it to update the stage
+        if (status !== undefined && status !== null) {
+          // Update to the new status
+          await ProjectContact.findOneAndUpdate(
+            { projectId: activity.projectId, contactId: activity.contactId },
+            { stage: status },
+            { upsert: false } // Don't create if it doesn't exist
+          );
+        } else {
+          // If status wasn't changed or was cleared, find the most recent activity with a status
+          const mostRecentActivity = await Activity.findOne({
+            contactId: activity.contactId,
+            projectId: activity.projectId,
+            status: { $exists: true, $ne: null }
+          })
+            .sort({ createdAt: -1 })
+            .lean();
+
+          if (mostRecentActivity && mostRecentActivity.status) {
+            // Update ProjectContact stage to match the most recent activity status
+            await ProjectContact.findOneAndUpdate(
+              { projectId: activity.projectId, contactId: activity.contactId },
+              { stage: mostRecentActivity.status },
+              { upsert: false } // Don't create if it doesn't exist
+            );
+          }
+          // If no activity with status exists, don't update - keep existing stage
+        }
+      } catch (updateError) {
+        // Log error but don't fail the activity update
+        console.error('Error updating ProjectContact stage:', updateError);
+      }
+    }
 
     console.log(`✓ Activity updated in database:`, {
       id: activity._id,

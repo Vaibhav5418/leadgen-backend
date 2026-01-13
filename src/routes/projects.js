@@ -137,6 +137,56 @@ router.post('/', authenticate, async (req, res) => {
   }
 });
 
+// Toggle project active status
+// IMPORTANT: This route must come before /:id to avoid route conflicts
+router.patch('/:id/status', authenticate, async (req, res) => {
+  try {
+    const projectId = req.params.id;
+    const { isActive } = req.body;
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
+    // Validate isActive is a boolean
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        error: 'isActive must be a boolean value'
+      });
+    }
+
+    const project = await Project.findById(projectId);
+
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    // Update status: active if isActive is true, draft if false
+    project.status = isActive ? 'active' : 'draft';
+    await project.save();
+
+    res.json({
+      success: true,
+      data: project,
+      message: `Project ${isActive ? 'activated' : 'deactivated'} successfully`
+    });
+  } catch (error) {
+    console.error('Error updating project status:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to update project status'
+    });
+  }
+});
+
 // Get comprehensive project analytics and dashboard data
 // IMPORTANT: This route must come before /:id to avoid route conflicts
 router.get('/analytics', authenticate, async (req, res) => {
@@ -1196,6 +1246,28 @@ router.get('/', authenticate, async (req, res) => {
         }
       },
       {
+        $lookup: {
+          from: 'projectcontacts',
+          let: { projectId: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$projectId', '$$projectId'] },
+                    { $in: ['$stage', ['SQL', 'WON']] }
+                  ]
+                }
+              }
+            },
+            {
+              $count: 'count'
+            }
+          ],
+          as: 'leadsCountArray'
+        }
+      },
+      {
         $project: {
           companyName: 1,
           website: 1,
@@ -1217,6 +1289,16 @@ router.get('/', authenticate, async (req, res) => {
             $let: {
               vars: {
                 countDoc: { $arrayElemAt: ['$prospectCountArray', 0] }
+              },
+              in: {
+                $ifNull: ['$$countDoc.count', 0]
+              }
+            }
+          },
+          leadsGenerated: {
+            $let: {
+              vars: {
+                countDoc: { $arrayElemAt: ['$leadsCountArray', 0] }
               },
               in: {
                 $ifNull: ['$$countDoc.count', 0]
@@ -2605,7 +2687,8 @@ function extractFieldValue(normalizedRow, fieldName, additionalVariations = [], 
     const matchedField = findMatchingField(key);
     if (matchedField === fieldName) {
       // Return the value as string, preserving empty strings
-      return value !== undefined && value !== null ? String(value) : '';
+      const strValue = value !== undefined && value !== null ? String(value) : '';
+      if (strValue.trim()) return strValue;
     }
   }
   
@@ -2619,7 +2702,8 @@ function extractFieldValue(normalizedRow, fieldName, additionalVariations = [], 
       const matchedField = findMatchingField(key);
       if (matchedField === fieldName) {
         // Return the value as string, preserving empty strings
-        return value !== undefined && value !== null ? String(value) : '';
+        const strValue = value !== undefined && value !== null ? String(value) : '';
+        if (strValue.trim()) return strValue;
       }
     }
   }
@@ -2630,19 +2714,43 @@ function extractFieldValue(normalizedRow, fieldName, additionalVariations = [], 
     // Try multiple normalization approaches
     const normalized = normalizeColumnName(variation);
     if (normalizedRow[normalized] !== undefined && normalizedRow[normalized] !== null) {
-      return String(normalizedRow[normalized]);
+      const strValue = String(normalizedRow[normalized]);
+      if (strValue.trim()) return strValue;
     }
     
     // Try lowercase version
     const lowerVariation = variation.toLowerCase().trim();
     if (normalizedRow[lowerVariation] !== undefined && normalizedRow[lowerVariation] !== null) {
-      return String(normalizedRow[lowerVariation]);
+      const strValue = String(normalizedRow[lowerVariation]);
+      if (strValue.trim()) return strValue;
     }
     
     // Try without separators
     const noSepVariation = lowerVariation.replace(/[_\-\s\.]/g, '');
     if (normalizedRow[noSepVariation] !== undefined && normalizedRow[noSepVariation] !== null) {
-      return String(normalizedRow[noSepVariation]);
+      const strValue = String(normalizedRow[noSepVariation]);
+      if (strValue.trim()) return strValue;
+    }
+    
+    // Try with spaces replaced by nothing (for "Person Linkedin Url" -> "personlinkedinurl")
+    const noSpaces = lowerVariation.replace(/\s+/g, '');
+    if (normalizedRow[noSpaces] !== undefined && normalizedRow[noSpaces] !== null) {
+      const strValue = String(normalizedRow[noSpaces]);
+      if (strValue.trim()) return strValue;
+    }
+  }
+  
+  // For LinkedIn URL specifically, do additional fuzzy matching
+  if (fieldName === 'personLinkedinUrl' && originalRow) {
+    for (const [key, value] of Object.entries(originalRow)) {
+      if (!value || String(value).trim() === '') continue;
+      const keyLower = key.toLowerCase().trim();
+      // Check if key contains linkedin-related terms (case-insensitive)
+      if ((keyLower.includes('linkedin') || keyLower.includes('linked in') || keyLower.includes('lin')) && 
+          (keyLower.includes('person') || keyLower.includes('profile') || keyLower.includes('url') || !keyLower.includes('company'))) {
+        const strValue = String(value).trim();
+        if (strValue) return strValue;
+      }
     }
   }
   
@@ -2792,7 +2900,9 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               'linkedinprofile', 'linkedin profile', 'personlinkedinprofile', 'person linkedin profile',
               'LinkedIn', 'LinkedIn URL', 'LinkedIn Url', 'Person LinkedIn', 'Person LinkedIn URL',
               'Person LinkedIn Url', 'LinkedIn Profile', 'Person LinkedIn Profile', 'LinkedInProfile',
-              'PersonLinkedIn', 'PersonLinkedInURL', 'PersonLinkedInUrl', 'linkedin', 'LinkedInURL'
+              'PersonLinkedIn', 'PersonLinkedInURL', 'PersonLinkedInUrl', 'linkedin', 'LinkedInURL',
+              'person linkedinurl', 'personlinkedin url', 'linkedin profile url', 'person linkedin profile url',
+              'linkedinprofileurl', 'personlinkedinprofileurl', 'person linkedinprofileurl'
             ], row);
             const website = extractFieldValue(normalizedRow, 'website', ['web', 'url', 'websiteurl', 'website url', 'site', 'webaddress', 'web address'], row);
             const companyLinkedinUrl = extractFieldValue(normalizedRow, 'companyLinkedinUrl', ['companylinkedinurl', 'company linkedin url', 'companylinkedin', 'company linkedin', 'companylinkedinprofile', 'company linkedin profile'], row);
@@ -2841,6 +2951,11 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             // Validate required fields
             const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.toString().trim()) ? personLinkedinUrl.toString().trim() : '';
             if (!trimmedPersonLinkedinUrl) {
+              // Log available columns for debugging (only for first error to avoid spam)
+              if (errors.length === 0 && rowNumber === 1) {
+                console.log('Available Excel columns:', Object.keys(row));
+                console.log('Normalized row keys:', Object.keys(normalizedRow));
+              }
               errors.push(`Row ${rowNumber + 1}: Person Linkedin Url is required`);
               return; // Skip this row
             }
