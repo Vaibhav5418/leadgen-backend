@@ -597,6 +597,473 @@ router.get('/analytics', authenticate, async (req, res) => {
   }
 });
 
+// Get comprehensive prospect analytics and dashboard data
+// IMPORTANT: This route must come before /:id to avoid route conflicts
+router.get('/prospect-analytics', authenticate, async (req, res) => {
+  try {
+    const Activity = require('../models/Activity');
+    const { projectId } = req.query;
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    // Build filter for project-specific or all projects
+    let projectFilter = {};
+    let projectIds = [];
+    
+    if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+      projectFilter = { projectId: new mongoose.Types.ObjectId(projectId) };
+      projectIds = [new mongoose.Types.ObjectId(projectId)];
+    } else {
+      const projects = await Project.find().lean();
+      projectIds = projects.map(p => p._id);
+      projectFilter = { projectId: { $in: projectIds } };
+    }
+    
+    // Parallel queries for performance
+    const [
+      totalProspects,
+      prospectsByStage,
+      prospectsByPriority,
+      activitiesByType,
+      activitiesByDate,
+      teamPerformance,
+      stageDistribution,
+      callFunnel,
+      emailFunnel,
+      linkedinFunnel,
+      recentActivities,
+      activityTrends,
+      conversionMetrics,
+      topPerformers
+    ] = await Promise.all([
+      // Total prospects
+      ProjectContact.countDocuments(projectFilter),
+      
+      // Prospects by stage
+      ProjectContact.aggregate([
+        { $match: projectFilter },
+        { $group: { _id: '$stage', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      
+      // Prospects by priority
+      ProjectContact.aggregate([
+        { $match: projectFilter },
+        { $group: { _id: '$priority', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      
+      // Activities by type
+      Activity.aggregate([
+        { $match: projectFilter },
+        { $group: { _id: '$type', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      
+      // Activities by date (last 30 days)
+      Activity.aggregate([
+        { 
+          $match: { 
+            ...projectFilter,
+            createdAt: { $gte: thirtyDaysAgo }
+          } 
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      
+      // Team performance
+      Activity.aggregate([
+        { $match: projectFilter },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'createdBy',
+            foreignField: '_id',
+            as: 'user'
+          }
+        },
+        { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+        {
+          $group: {
+            _id: '$createdBy',
+            name: { $first: '$user.name' },
+            email: { $first: '$user.email' },
+            activityCount: { $sum: 1 },
+            calls: { $sum: { $cond: [{ $eq: ['$type', 'call'] }, 1, 0] } },
+            emails: { $sum: { $cond: [{ $eq: ['$type', 'email'] }, 1, 0] } },
+            linkedin: { $sum: { $cond: [{ $eq: ['$type', 'linkedin'] }, 1, 0] } }
+          }
+        },
+        { $sort: { activityCount: -1 } },
+        { $limit: 10 }
+      ]),
+      
+      // Stage distribution with details
+      ProjectContact.aggregate([
+        { $match: projectFilter },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'contact'
+          }
+        },
+        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: true } },
+        {
+          $group: {
+            _id: '$stage',
+            count: { $sum: 1 },
+            avgPriority: {
+              $avg: {
+                $cond: [
+                  { $eq: ['$priority', 'High'] }, 3,
+                  { $cond: [{ $eq: ['$priority', 'Medium'] }, 2, 1] }
+                ]
+              }
+            }
+          }
+        },
+        { $sort: { count: -1 } }
+      ]),
+      
+      // Cold Calling Funnel
+      Activity.aggregate([
+        {
+          $match: {
+            ...projectFilter,
+            type: 'call'
+          }
+        },
+        {
+          $group: {
+            _id: '$contactId',
+            callDate: { $max: '$callDate' },
+            callStatus: { $last: '$callStatus' },
+            callNumber: { $max: '$callNumber' },
+            nextAction: { $last: '$nextAction' },
+            nextActionDate: { $max: '$nextActionDate' },
+            conversationNotes: { $last: '$conversationNotes' }
+          }
+        }
+      ]),
+      
+      // Email Funnel
+      Activity.aggregate([
+        {
+          $match: {
+            ...projectFilter,
+            type: 'email'
+          }
+        },
+        {
+          $group: {
+            _id: '$contactId',
+            emailDate: { $max: '$emailDate' },
+            status: { $last: '$status' },
+            outcome: { $last: '$outcome' }
+          }
+        }
+      ]),
+      
+      // LinkedIn Funnel
+      Activity.aggregate([
+        {
+          $match: {
+            ...projectFilter,
+            type: 'linkedin'
+          }
+        },
+        {
+          $group: {
+            _id: '$contactId',
+            linkedinDate: { $max: '$linkedinDate' },
+            status: { $last: '$status' },
+            lnRequestSent: { $last: '$lnRequestSent' },
+            connected: { $last: '$connected' }
+          }
+        }
+      ]),
+      
+      // Recent activities
+      Activity.aggregate([
+        { $match: projectFilter },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'contact'
+          }
+        },
+        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: true } },
+        { $sort: { createdAt: -1 } },
+        { $limit: 10 },
+        {
+          $project: {
+            type: 1,
+            outcome: 1,
+            status: 1,
+            createdAt: 1,
+            contactName: '$contact.name'
+          }
+        }
+      ]),
+      
+      // Activity trends (last 7 days)
+      Activity.aggregate([
+        {
+          $match: {
+            ...projectFilter,
+            createdAt: { $gte: sevenDaysAgo }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+              type: '$type'
+            },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { '_id.date': 1 } }
+      ]),
+      
+      // Conversion metrics
+      ProjectContact.aggregate([
+        { $match: projectFilter },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            won: { $sum: { $cond: [{ $eq: ['$stage', 'WON'] }, 1, 0] } },
+            lost: { $sum: { $cond: [{ $eq: ['$stage', 'Lost'] }, 1, 0] } },
+            meetings: {
+              $sum: {
+                $cond: [
+                  { $in: ['$stage', ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting']] },
+                  1,
+                  0
+                ]
+              }
+            },
+            sql: { $sum: { $cond: [{ $eq: ['$stage', 'SQL'] }, 1, 0] } },
+            cip: { $sum: { $cond: [{ $eq: ['$stage', 'CIP'] }, 1, 0] } }
+          }
+        }
+      ]),
+      
+      // Top performing prospects (by activity count)
+      Activity.aggregate([
+        { $match: projectFilter },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'contact'
+          }
+        },
+        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: true } },
+        {
+          $group: {
+            _id: '$contactId',
+            name: { $first: '$contact.name' },
+            company: { $first: '$contact.company' },
+            activityCount: { $sum: 1 },
+            lastActivity: { $max: '$createdAt' }
+          }
+        },
+        { $sort: { activityCount: -1 } },
+        { $limit: 10 }
+      ])
+    ]);
+    
+    // Calculate Cold Calling Funnel
+    const callFunnelData = {
+      prospectData: totalProspects,
+      callSent: callFunnel.filter(c => c.callDate).length,
+      accepted: callFunnel.filter(c => ['Interested', 'Details Shared', 'Demo Booked'].includes(c.callStatus)).length,
+      followups: callFunnel.filter(c => {
+        const callNum = c.callNumber;
+        return callNum && (callNum.includes('2nd') || callNum.includes('3rd') || callNum.includes('4th') || callNum.includes('5th') || callNum.includes('6th') || callNum.includes('7th') || callNum.includes('8th') || callNum.includes('9th') || callNum.includes('10th'));
+      }).length,
+      cip: callFunnel.filter(c => ['Interested', 'Call Back', 'Future'].includes(c.callStatus)).length,
+      meetingProposed: callFunnel.filter(c => c.nextAction && (
+        c.nextAction.toLowerCase().includes('meeting') ||
+        c.nextAction.toLowerCase().includes('demo') ||
+        c.nextAction.toLowerCase().includes('call')
+      )).length,
+      scheduled: callFunnel.filter(c => c.callStatus === 'Demo Booked' || c.nextActionDate).length,
+      completed: callFunnel.filter(c => c.callStatus === 'Demo Completed').length,
+      sql: callFunnel.filter(c => c.callStatus === 'Demo Completed' || 
+        (c.callStatus === 'Interested' && c.conversationNotes && c.conversationNotes.length > 50)).length
+    };
+    
+    // Calculate Email Funnel
+    const emailFunnelData = {
+      prospectData: totalProspects,
+      emailSent: emailFunnel.filter(e => e.emailDate).length,
+      accepted: emailFunnel.filter(e => ['Interested', 'Meeting Proposed'].includes(e.status)).length,
+      followups: emailFunnel.filter(e => e.outcome && e.outcome.toLowerCase().includes('follow')).length,
+      cip: emailFunnel.filter(e => e.status === 'CIP').length,
+      meetingProposed: emailFunnel.filter(e => e.status === 'Meeting Proposed').length,
+      scheduled: emailFunnel.filter(e => e.status === 'Meeting Scheduled').length,
+      completed: emailFunnel.filter(e => e.status === 'Meeting Completed').length,
+      sql: emailFunnel.filter(e => e.status === 'SQL' || e.status === 'Meeting Completed').length
+    };
+    
+    // Calculate LinkedIn Funnel
+    const linkedinFunnelData = {
+      prospectData: totalProspects,
+      connectionSent: linkedinFunnel.filter(l => l.lnRequestSent === 'Yes' || l.lnRequestSent === true).length,
+      accepted: linkedinFunnel.filter(l => l.connected === 'Yes' || l.connected === true).length,
+      followups: linkedinFunnel.filter(l => l.status && l.status !== 'CIP').length,
+      cip: linkedinFunnel.filter(l => l.status === 'CIP').length,
+      meetingProposed: linkedinFunnel.filter(l => l.status === 'Meeting Proposed').length,
+      scheduled: linkedinFunnel.filter(l => l.status === 'Meeting Scheduled').length,
+      completed: linkedinFunnel.filter(l => l.status === 'Meeting Completed').length,
+      sql: linkedinFunnel.filter(l => l.status === 'SQL' || l.status === 'Meeting Completed').length
+    };
+    
+    // Process conversion metrics
+    const conversionData = conversionMetrics[0] || {
+      total: 0,
+      won: 0,
+      lost: 0,
+      meetings: 0,
+      sql: 0,
+      cip: 0
+    };
+    
+    const winRate = conversionData.total > 0 
+      ? ((conversionData.won / conversionData.total) * 100).toFixed(1)
+      : 0;
+    const meetingRate = conversionData.total > 0
+      ? ((conversionData.meetings / conversionData.total) * 100).toFixed(1)
+      : 0;
+    
+    // Process activity trends
+    const trendData = {};
+    activityTrends.forEach(item => {
+      const date = item._id.date;
+      if (!trendData[date]) {
+        trendData[date] = { call: 0, email: 0, linkedin: 0 };
+      }
+      trendData[date][item._id.type] = item.count;
+    });
+    
+    const trendLabels = Object.keys(trendData).sort();
+    const trendCallData = trendLabels.map(date => trendData[date].call || 0);
+    const trendEmailData = trendLabels.map(date => trendData[date].email || 0);
+    const trendLinkedInData = trendLabels.map(date => trendData[date].linkedin || 0);
+    
+    // Get project info if specific project
+    let projectInfo = null;
+    if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+      const project = await Project.findById(projectId).lean();
+      if (project) {
+        projectInfo = {
+          id: project._id.toString(),
+          companyName: project.companyName,
+          status: project.status
+        };
+      }
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        project: projectInfo,
+        overview: {
+          totalProspects,
+          totalActivities: activitiesByType.reduce((sum, a) => sum + a.count, 0)
+        },
+        prospects: {
+          byStage: prospectsByStage.map(item => ({
+            stage: item._id,
+            count: item.count
+          })),
+          byPriority: prospectsByPriority.map(item => ({
+            priority: item._id,
+            count: item.count
+          })),
+          stageDistribution: stageDistribution.map(item => ({
+            stage: item._id,
+            count: item.count,
+            avgPriority: item.avgPriority ? parseFloat(item.avgPriority.toFixed(2)) : 0
+          }))
+        },
+        activities: {
+          byType: activitiesByType.map(item => ({
+            type: item._id,
+            count: item.count
+          })),
+          byDate: activitiesByDate,
+          trends: {
+            labels: trendLabels,
+            call: trendCallData,
+            email: trendEmailData,
+            linkedin: trendLinkedInData
+          }
+        },
+        funnels: {
+          coldCalling: callFunnelData,
+          email: emailFunnelData,
+          linkedin: linkedinFunnelData
+        },
+        pipeline: {
+          conversion: {
+            winRate: parseFloat(winRate),
+            meetingRate: parseFloat(meetingRate),
+            total: conversionData.total,
+            won: conversionData.won,
+            lost: conversionData.lost,
+            meetings: conversionData.meetings,
+            sql: conversionData.sql,
+            cip: conversionData.cip
+          }
+        },
+        team: {
+          performance: teamPerformance.map(member => ({
+            id: member._id?.toString(),
+            name: member.name || 'Unknown',
+            email: member.email || '',
+            totalActivities: member.activityCount,
+            calls: member.calls,
+            emails: member.emails,
+            linkedin: member.linkedin
+          }))
+        },
+        topPerformers: topPerformers.map(prospect => ({
+          id: prospect._id?.toString(),
+          name: prospect.name || 'Unknown',
+          company: prospect.company || '',
+          activityCount: prospect.activityCount,
+          lastActivity: prospect.lastActivity
+        })),
+        recent: {
+          activities: recentActivities
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching prospect analytics:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch prospect analytics'
+    });
+  }
+});
+
 // Get all projects
 router.get('/', authenticate, async (req, res) => {
   try {
