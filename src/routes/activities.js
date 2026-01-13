@@ -90,9 +90,9 @@ router.post('/', authenticate, async (req, res) => {
       connected: connected || null,
       callNumber: callNumber || null,
       callStatus: callStatus || null,
-      callDate: callDate ? new Date(callDate) : null,
-      emailDate: emailDate ? new Date(emailDate) : null,
-      linkedinDate: linkedinDate ? new Date(linkedinDate) : null,
+      callDate: (callDate && callDate.trim && callDate.trim() !== '') ? new Date(callDate) : null,
+      emailDate: (emailDate && emailDate.trim && emailDate.trim() !== '') ? new Date(emailDate) : null,
+      linkedinDate: (linkedinDate && linkedinDate.trim && linkedinDate.trim() !== '') ? new Date(linkedinDate) : null,
       createdBy: req.user._id
     });
 
@@ -385,9 +385,9 @@ router.put('/:id', authenticate, async (req, res) => {
     if (connected !== undefined) activity.connected = connected || null;
     if (callNumber !== undefined) activity.callNumber = callNumber || null;
     if (callStatus !== undefined) activity.callStatus = callStatus || null;
-    if (callDate !== undefined) activity.callDate = callDate ? new Date(callDate) : null;
-    if (emailDate !== undefined) activity.emailDate = emailDate ? new Date(emailDate) : null;
-    if (linkedinDate !== undefined) activity.linkedinDate = linkedinDate ? new Date(linkedinDate) : null;
+    if (callDate !== undefined) activity.callDate = (callDate && callDate.trim && callDate.trim() !== '') ? new Date(callDate) : null;
+    if (emailDate !== undefined) activity.emailDate = (emailDate && emailDate.trim && emailDate.trim() !== '') ? new Date(emailDate) : null;
+    if (linkedinDate !== undefined) activity.linkedinDate = (linkedinDate && linkedinDate.trim && linkedinDate.trim() !== '') ? new Date(linkedinDate) : null;
 
     await activity.save();
 
