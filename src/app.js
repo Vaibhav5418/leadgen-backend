@@ -48,8 +48,39 @@ app.use(express.urlencoded({ extended: true }));
 // MongoDB Atlas Connection
 const MONGODB_URI = process.env.MONGODB_URI;
 
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('✅ MongoDB Atlas connected successfully'))
+// Connection options to handle reconnection and prevent ECONNRESET errors
+const mongooseOptions = {
+  serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+  socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
+  connectTimeoutMS: 10000, // Give up initial connection after 10s
+  maxPoolSize: 10, // Maintain up to 10 socket connections
+  minPoolSize: 2, // Maintain at least 2 socket connections
+  maxIdleTimeMS: 30000, // Close connections after 30s of inactivity
+  retryWrites: true, // Retry write operations on network errors
+  retryReads: true, // Retry read operations on network errors
+};
+
+mongoose.connect(MONGODB_URI, mongooseOptions)
+  .then(() => {
+    console.log('✅ MongoDB Atlas connected successfully');
+    
+    // Handle connection events
+    mongoose.connection.on('error', (err) => {
+      console.error('❌ MongoDB connection error:', err.message);
+    });
+    
+    mongoose.connection.on('disconnected', () => {
+      console.warn('⚠️ MongoDB disconnected. Attempting to reconnect...');
+    });
+    
+    mongoose.connection.on('reconnected', () => {
+      console.log('✅ MongoDB reconnected successfully');
+    });
+    
+    mongoose.connection.on('close', () => {
+      console.warn('⚠️ MongoDB connection closed');
+    });
+  })
   .catch((err) => {
     console.error('❌ MongoDB connection error:', err.message);
     console.log('💡 Make sure to set MONGODB_URI in your .env file');

@@ -147,5 +147,10 @@ contactSchema.index({ email: 1, title: 1, company: 1 }); // Compound index for o
 contactSchema.index({ state: 1, country: 1 }); // Compound index for geographic queries
 contactSchema.index({ industry: 1, title: 1 }); // Compound index for ICP matching
 contactSchema.index({ keywords: 1 }); // Index for keyword searches
+// Additional compound indexes for common query patterns
+contactSchema.index({ category: 1, createdAt: -1 }); // For category filtering with sorting
+contactSchema.index({ company: 1, createdAt: -1 }); // For company filtering with sorting
+contactSchema.index({ email: 1, createdAt: -1 }); // For email queries with sorting
+contactSchema.index({ name: 1, email: 1 }); // Compound index for duplicate checking
 
 module.exports = mongoose.model('Contact', contactSchema);

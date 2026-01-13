@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Contact = require('../models/Contact');
+const ProspectContact = require('../models/ProspectContact');
 const authenticate = require('../middleware/auth');
 
 // Helper function to check for duplicates
@@ -513,14 +514,25 @@ router.get('/', async (req, res) => {
     }
     
     // Run count and find queries in parallel for better performance
-    const [totalCount, contacts] = await Promise.all([
-      Contact.countDocuments(filter),
-      Contact.find(filter)
-        .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website')
+    // Use hint to guide MongoDB to use the best index
+    const query = Contact.find(filter)
+      .select('name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website')
       .sort({ name: 1 })
       .skip(skip)
-        .limit(limitNum)
-        .lean() // Use lean() for faster queries (returns plain JS objects)
+      .limit(limitNum)
+      .lean(); // Use lean() for faster queries (returns plain JS objects)
+    
+    // Add index hint if category filter is present
+    if (category) {
+      query.hint({ category: 1, createdAt: -1 });
+    } else if (Object.keys(filter).length > 0) {
+      // Use name index for general queries
+      query.hint({ name: 1 });
+    }
+    
+    const [totalCount, contacts] = await Promise.all([
+      Contact.countDocuments(filter),
+      query
     ]);
     
     res.json({
@@ -903,7 +915,11 @@ router.get('/companies', async (req, res) => {
 // Get single contact by ID
 router.get('/:id', async (req, res) => {
   try {
-    const contact = await Contact.findById(req.params.id);
+    // Try ProspectContact first (for project contacts), then Contact (for databank contacts)
+    let contact = await ProspectContact.findById(req.params.id).lean();
+    if (!contact) {
+      contact = await Contact.findById(req.params.id).lean();
+    }
     if (!contact) {
       return res.status(404).json({ 
         success: false,

@@ -9,7 +9,7 @@ const projectContactSchema = new mongoose.Schema({
   },
   contactId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Contact',
+    ref: 'ProspectContact',
     required: true,
     index: true
   },
@@ -68,5 +68,8 @@ projectContactSchema.index({ projectId: 1, stage: 1 });
 
 // Index for filtering by assignedTo
 projectContactSchema.index({ projectId: 1, assignedTo: 1 });
+
+// Index for faster lookups when fetching project contacts
+projectContactSchema.index({ projectId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('ProjectContact', projectContactSchema);

@@ -8,7 +8,7 @@ const activitySchema = new mongoose.Schema({
   },
   contactId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Contact',
+    ref: 'ProspectContact',
     required: false,
     default: null
   },
@@ -117,7 +117,7 @@ const activitySchema = new mongoose.Schema({
   callNumber: {
     type: String,
     required: false,
-    enum: ['1st call', '2nd call', '3rd call'],
+    enum: ['1st call', '2nd call', '3rd call', '4th call', '5th call', '6th call', '7th call', '8th call', '9th call', '10th call'],
     default: null
   },
   callStatus: {

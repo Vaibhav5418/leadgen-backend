@@ -1,7 +1,12 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Activity = require('../models/Activity');
+const ProspectContact = require('../models/ProspectContact');
 const authenticate = require('../middleware/auth');
+
+// Mongoose automatically pluralizes and lowercases: 'ProspectContact' -> 'prospectcontacts'
+const PROSPECT_CONTACT_COLLECTION = 'prospectcontacts';
 
 // Create a new activity
 router.post('/', authenticate, async (req, res) => {
@@ -151,10 +156,86 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
 // Get all activities for a contact
 router.get('/contact/:contactId', authenticate, async (req, res) => {
   try {
-    const activities = await Activity.find({ contactId: req.params.contactId })
-      .populate('projectId', 'companyName')
-      .sort({ createdAt: -1 })
-      .lean();
+    const contactObjectId = new mongoose.Types.ObjectId(req.params.contactId);
+    
+    // First verify the contact exists in ProspectContact
+    const contact = await ProspectContact.findById(contactObjectId).lean();
+    if (!contact) {
+      return res.status(404).json({
+        success: false,
+        error: 'Contact not found in ProspectContact'
+      });
+    }
+    
+    // Use aggregation for better performance - lookup from ProspectContact collection
+    const activities = await Activity.aggregate([
+      { $match: { contactId: contactObjectId } },
+      {
+        $lookup: {
+          from: 'projects',
+          localField: 'projectId',
+          foreignField: '_id',
+          as: 'project'
+        }
+      },
+      {
+        $unwind: {
+          path: '$project',
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      {
+        $lookup: {
+          from: PROSPECT_CONTACT_COLLECTION,
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'contact'
+        }
+      },
+      {
+        $unwind: {
+          path: '$contact',
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      {
+        $project: {
+          projectId: {
+            _id: '$project._id',
+            companyName: '$project.companyName'
+          },
+          contactId: 1,
+          contact: {
+            _id: '$contact._id',
+            name: '$contact.name',
+            email: '$contact.email',
+            company: '$contact.company'
+          },
+          type: 1,
+          template: 1,
+          outcome: 1,
+          conversationNotes: 1,
+          nextAction: 1,
+          nextActionDate: 1,
+          phoneNumber: 1,
+          email: 1,
+          linkedInUrl: 1,
+          status: 1,
+          linkedInAccountName: 1,
+          lnRequestSent: 1,
+          connected: 1,
+          callNumber: 1,
+          callStatus: 1,
+          callDate: 1,
+          emailDate: 1,
+          linkedinDate: 1,
+          createdBy: 1,
+          createdAt: 1,
+          updatedAt: 1
+        }
+      },
+      { $sort: { createdAt: -1 } }
+    ]);
 
     res.json({
       success: true,

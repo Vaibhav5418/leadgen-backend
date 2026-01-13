@@ -1,12 +1,17 @@
 const express = require('express');
 const router = express.Router();
 const Contact = require('../models/Contact');
+const ProspectContact = require('../models/ProspectContact');
 const { fetchLinkedInDataMock } = require('../services/linkedin');
 
 // Get stored LinkedIn data
 router.get('/:contactId', async (req, res) => {
   try {
-    const contact = await Contact.findById(req.params.contactId);
+    // Try ProspectContact first (for project contacts), then Contact (for databank contacts)
+    let contact = await ProspectContact.findById(req.params.contactId);
+    if (!contact) {
+      contact = await Contact.findById(req.params.contactId);
+    }
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -25,7 +30,13 @@ router.get('/:contactId', async (req, res) => {
 // Fetch from LinkedIn (mock) and store
 router.get('/fetch/:contactId', async (req, res) => {
   try {
-    const contact = await Contact.findById(req.params.contactId);
+    // Try ProspectContact first (for project contacts), then Contact (for databank contacts)
+    let contact = await ProspectContact.findById(req.params.contactId);
+    let isProspectContact = true;
+    if (!contact) {
+      contact = await Contact.findById(req.params.contactId);
+      isProspectContact = false;
+    }
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -53,7 +64,7 @@ router.get('/fetch/:contactId', async (req, res) => {
     
     contact.lastLinkedInFetch = new Date();
     const savedContact = await contact.save();
-    console.log('Saved contact linkedinData:', savedContact.linkedinData);
+    console.log(`Saved ${isProspectContact ? 'prospect ' : ''}contact linkedinData:`, savedContact.linkedinData);
 
     // Convert to plain object to ensure all fields are included
     const contactObj = savedContact.toObject ? savedContact.toObject() : savedContact;

@@ -59,7 +59,7 @@ router.get('/stats', async (req, res) => {
       dncContacts,
       contactsLastMonth
     ] = await Promise.all([
-      Contact.countDocuments(),
+      Contact.estimatedDocumentCount(), // Much faster than countDocuments() for large collections
       Contact.distinct('company'),
       Contact.countDocuments({ createdAt: { $gte: thisMonthStart } }),
       Contact.countDocuments({ email: { $exists: true, $ne: '', $regex: /.+@.+\..+/ } }),
@@ -90,7 +90,8 @@ router.get('/stats', async (req, res) => {
       })
     ]);
     
-    const totalAccounts = companies.filter(c => c && c.trim() !== '').length;
+    // Limit companies processing to prevent memory issues for very large datasets
+    const totalAccounts = companies.slice(0, 10000).filter(c => c && c.trim() !== '').length;
     
     // Duplicate detection (optimized - run in parallel with other queries if possible)
     // For very large datasets, this can be expensive, so we'll limit the scope

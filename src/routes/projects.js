@@ -7,8 +7,13 @@ const { Readable } = require('stream');
 const mongoose = require('mongoose');
 const Project = require('../models/Project');
 const Contact = require('../models/Contact');
+const ProspectContact = require('../models/ProspectContact');
 const ProjectContact = require('../models/ProjectContact');
 const authenticate = require('../middleware/auth');
+
+// Get the actual MongoDB collection name for ProspectContact
+// Mongoose automatically pluralizes and lowercases: 'ProspectContact' -> 'prospectcontacts'
+const PROSPECT_CONTACT_COLLECTION = 'prospectcontacts';
 
 // Configure multer for file uploads
 const upload = multer({
@@ -131,6 +136,467 @@ router.post('/', authenticate, async (req, res) => {
   }
 });
 
+// Get comprehensive project analytics and dashboard data
+// IMPORTANT: This route must come before /:id to avoid route conflicts
+router.get('/analytics', authenticate, async (req, res) => {
+  try {
+    const Activity = require('../models/Activity');
+    const now = new Date();
+    const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    // Get all projects with basic stats
+    const projects = await Project.find().lean();
+    const projectIds = projects.map(p => p._id);
+    
+    // Parallel queries for performance
+    const [
+      totalProjects,
+      activeProjects,
+      draftProjects,
+      completedProjects,
+      totalProspects,
+      totalActivities,
+      activitiesByType,
+      activitiesByDate,
+      stageDistribution,
+      channelUsage,
+      teamPerformance,
+      projectHealth,
+      topProjects,
+      conversionMetrics,
+      activityTrends,
+      recentActivities
+    ] = await Promise.all([
+      // Basic counts
+      Project.countDocuments(),
+      Project.countDocuments({ status: 'active' }),
+      Project.countDocuments({ status: 'draft' }),
+      Project.countDocuments({ status: 'completed' }),
+      
+      // Prospect counts
+      ProjectContact.countDocuments(),
+      
+      // Activity counts
+      Activity.countDocuments(),
+      
+      // Activities by type
+      Activity.aggregate([
+        { $match: { projectId: { $in: projectIds } } },
+        { $group: { _id: '$type', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      
+      // Activities by date (last 30 days)
+      Activity.aggregate([
+        { 
+          $match: { 
+            projectId: { $in: projectIds },
+            createdAt: { $gte: thirtyDaysAgo }
+          } 
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { _id: 1 } }
+      ]),
+      
+      // Stage distribution
+      ProjectContact.aggregate([
+        { $group: { _id: '$stage', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      
+      // Channel usage across projects
+      Project.aggregate([
+        {
+          $project: {
+            linkedIn: { $cond: [{ $eq: ['$channels.linkedInOutreach', true] }, 1, 0] },
+            email: { $cond: [{ $eq: ['$channels.coldEmail', true] }, 1, 0] },
+            calling: { $cond: [{ $eq: ['$channels.coldCalling', true] }, 1, 0] }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            linkedIn: { $sum: '$linkedIn' },
+            email: { $sum: '$email' },
+            calling: { $sum: '$calling' }
+          }
+        }
+      ]),
+      
+      // Team performance (activities per team member)
+      Activity.aggregate([
+        { $match: { projectId: { $in: projectIds } } },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'createdBy',
+            foreignField: '_id',
+            as: 'user'
+          }
+        },
+        { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+        {
+          $group: {
+            _id: '$createdBy',
+            name: { $first: '$user.name' },
+            email: { $first: '$user.email' },
+            activityCount: { $sum: 1 },
+            calls: { $sum: { $cond: [{ $eq: ['$type', 'call'] }, 1, 0] } },
+            emails: { $sum: { $cond: [{ $eq: ['$type', 'email'] }, 1, 0] } },
+            linkedin: { $sum: { $cond: [{ $eq: ['$type', 'linkedin'] }, 1, 0] } }
+          }
+        },
+        { $sort: { activityCount: -1 } },
+        { $limit: 10 }
+      ]),
+      
+      // Project health metrics
+      Project.aggregate([
+        {
+          $lookup: {
+            from: 'projectcontacts',
+            localField: '_id',
+            foreignField: 'projectId',
+            as: 'contacts'
+          }
+        },
+        {
+          $lookup: {
+            from: 'activities',
+            localField: '_id',
+            foreignField: 'projectId',
+            as: 'activities'
+          }
+        },
+        {
+          $project: {
+            _id: 1,
+            companyName: 1,
+            status: 1,
+            contactCount: { $size: '$contacts' },
+            activityCount: { $size: '$activities' },
+            recentActivity: {
+              $size: {
+                $filter: {
+                  input: '$activities',
+                  as: 'activity',
+                  cond: { $gte: ['$$activity.createdAt', sevenDaysAgo] }
+                }
+              }
+            },
+            wonCount: {
+              $size: {
+                $filter: {
+                  input: '$contacts',
+                  as: 'contact',
+                  cond: { $eq: ['$$contact.stage', 'WON'] }
+                }
+              }
+            },
+            lostCount: {
+              $size: {
+                $filter: {
+                  input: '$contacts',
+                  as: 'contact',
+                  cond: { $eq: ['$$contact.stage', 'Lost'] }
+                }
+              }
+            }
+          }
+        },
+        {
+          $addFields: {
+            healthScore: {
+              $add: [
+                { $multiply: [{ $min: [{ $divide: ['$contactCount', 100] }, 1] }, 30] },
+                { $multiply: [{ $min: [{ $divide: ['$activityCount', 50] }, 1] }, 30] },
+                { $multiply: [{ $min: [{ $divide: ['$recentActivity', 10] }, 1] }, 20] },
+                { $multiply: [{ $min: [{ $divide: ['$wonCount', 10] }, 1] }, 20] }
+              ]
+            }
+          }
+        },
+        { $sort: { healthScore: -1 } },
+        { $limit: 20 }
+      ]),
+      
+      // Top performing projects
+      Project.aggregate([
+        {
+          $lookup: {
+            from: 'projectcontacts',
+            localField: '_id',
+            foreignField: 'projectId',
+            as: 'contacts'
+          }
+        },
+        {
+          $lookup: {
+            from: 'activities',
+            localField: '_id',
+            foreignField: 'projectId',
+            as: 'activities'
+          }
+        },
+        {
+          $project: {
+            _id: 1,
+            companyName: 1,
+            status: 1,
+            contactCount: { $size: '$contacts' },
+            activityCount: { $size: '$activities' },
+            wonCount: {
+              $size: {
+                $filter: {
+                  input: '$contacts',
+                  as: 'contact',
+                  cond: { $eq: ['$$contact.stage', 'WON'] }
+                }
+              }
+            },
+            meetingCount: {
+              $size: {
+                $filter: {
+                  input: '$contacts',
+                  as: 'contact',
+                  cond: { $in: ['$$contact.stage', ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting']] }
+                }
+              }
+            }
+          }
+        },
+        { $sort: { wonCount: -1, meetingCount: -1 } },
+        { $limit: 10 }
+      ]),
+      
+      // Conversion metrics
+      ProjectContact.aggregate([
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            won: { $sum: { $cond: [{ $eq: ['$stage', 'WON'] }, 1, 0] } },
+            lost: { $sum: { $cond: [{ $eq: ['$stage', 'Lost'] }, 1, 0] } },
+            meetings: {
+              $sum: {
+                $cond: [
+                  { $in: ['$stage', ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting']] },
+                  1,
+                  0
+                ]
+              }
+            },
+            sql: { $sum: { $cond: [{ $eq: ['$stage', 'SQL'] }, 1, 0] } },
+            cip: { $sum: { $cond: [{ $eq: ['$stage', 'CIP'] }, 1, 0] } }
+          }
+        }
+      ]),
+      
+      // Activity trends (last 7 days)
+      Activity.aggregate([
+        {
+          $match: {
+            projectId: { $in: projectIds },
+            createdAt: { $gte: sevenDaysAgo }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+              type: '$type'
+            },
+            count: { $sum: 1 }
+          }
+        },
+        { $sort: { '_id.date': 1 } }
+      ]),
+      
+      // Recent activities
+      Activity.aggregate([
+        { $match: { projectId: { $in: projectIds } } },
+        {
+          $lookup: {
+            from: 'projects',
+            localField: 'projectId',
+            foreignField: '_id',
+            as: 'project'
+          }
+        },
+        { $unwind: { path: '$project', preserveNullAndEmptyArrays: true } },
+        { $sort: { createdAt: -1 } },
+        { $limit: 10 },
+        {
+          $project: {
+            type: 1,
+            outcome: 1,
+            createdAt: 1,
+            projectName: '$project.companyName'
+          }
+        }
+      ])
+    ]);
+    
+    // Process channel usage
+    const channelData = channelUsage[0] || { linkedIn: 0, email: 0, calling: 0 };
+    
+    // Process conversion metrics
+    const conversionData = conversionMetrics[0] || {
+      total: 0,
+      won: 0,
+      lost: 0,
+      meetings: 0,
+      sql: 0,
+      cip: 0
+    };
+    
+    const winRate = conversionData.total > 0 
+      ? ((conversionData.won / conversionData.total) * 100).toFixed(1)
+      : 0;
+    const meetingRate = conversionData.total > 0
+      ? ((conversionData.meetings / conversionData.total) * 100).toFixed(1)
+      : 0;
+    
+    // Process activity trends
+    const trendData = {};
+    activityTrends.forEach(item => {
+      const date = item._id.date;
+      if (!trendData[date]) {
+        trendData[date] = { call: 0, email: 0, linkedin: 0 };
+      }
+      trendData[date][item._id.type] = item.count;
+    });
+    
+    const trendLabels = Object.keys(trendData).sort();
+    const trendCallData = trendLabels.map(date => trendData[date].call || 0);
+    const trendEmailData = trendLabels.map(date => trendData[date].email || 0);
+    const trendLinkedInData = trendLabels.map(date => trendData[date].linkedin || 0);
+    
+    // Process activities by date
+    const activityDateMap = {};
+    activitiesByDate.forEach(item => {
+      activityDateMap[item._id] = item.count;
+    });
+    
+    // Calculate monthly project growth
+    const monthlyGrowth = await Project.aggregate([
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m', date: '$createdAt' } },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } },
+      { $limit: 12 }
+    ]);
+    
+    res.json({
+      success: true,
+      data: {
+        overview: {
+          totalProjects,
+          activeProjects,
+          draftProjects,
+          completedProjects,
+          totalProspects,
+          totalActivities
+        },
+        activities: {
+          byType: activitiesByType.map(item => ({
+            type: item._id,
+            count: item.count
+          })),
+          byDate: activitiesByDate,
+          trends: {
+            labels: trendLabels,
+            call: trendCallData,
+            email: trendEmailData,
+            linkedin: trendLinkedInData
+          }
+        },
+        pipeline: {
+          stageDistribution: stageDistribution.map(item => ({
+            stage: item._id,
+            count: item.count
+          })),
+          conversion: {
+            winRate: parseFloat(winRate),
+            meetingRate: parseFloat(meetingRate),
+            total: conversionData.total,
+            won: conversionData.won,
+            lost: conversionData.lost,
+            meetings: conversionData.meetings,
+            sql: conversionData.sql,
+            cip: conversionData.cip
+          }
+        },
+        channels: {
+          linkedIn: channelData.linkedIn || 0,
+          email: channelData.email || 0,
+          calling: channelData.calling || 0
+        },
+        team: {
+          performance: teamPerformance.map(member => ({
+            id: member._id?.toString(),
+            name: member.name || 'Unknown',
+            email: member.email || '',
+            totalActivities: member.activityCount,
+            calls: member.calls,
+            emails: member.emails,
+            linkedin: member.linkedin
+          }))
+        },
+        projects: {
+          health: projectHealth.map(project => ({
+            id: project._id.toString(),
+            companyName: project.companyName,
+            status: project.status,
+            contactCount: project.contactCount,
+            activityCount: project.activityCount,
+            recentActivity: project.recentActivity,
+            wonCount: project.wonCount,
+            lostCount: project.lostCount,
+            healthScore: Math.round(project.healthScore)
+          })),
+          topPerformers: topProjects.map(project => ({
+            id: project._id.toString(),
+            companyName: project.companyName,
+            status: project.status,
+            contactCount: project.contactCount,
+            activityCount: project.activityCount,
+            wonCount: project.wonCount,
+            meetingCount: project.meetingCount
+          }))
+        },
+        growth: {
+          monthly: monthlyGrowth.map(item => ({
+            month: item._id,
+            count: item.count
+          }))
+        },
+        recent: {
+          activities: recentActivities
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching project analytics:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch project analytics'
+    });
+  }
+});
+
 // Get all projects
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -149,78 +615,56 @@ router.get('/', authenticate, async (req, res) => {
       ];
     }
 
-    const projects = await Project.find(filter)
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 })
-      .lean();
-    
-    // Manually populate createdBy if it's still an ObjectId (lean() sometimes doesn't populate correctly)
+    // Use aggregation for better performance - single query instead of populate + manual fetch
     const User = require('../models/User');
-    const mongoose = require('mongoose');
-    
-    // Extract user IDs properly - handle both populated and unpopulated cases
-    const userIdsToFetch = [];
-    
-    projects.forEach(project => {
-      if (project.createdBy) {
-        // Check if already populated (has name or email property)
-        if (project.createdBy.name || project.createdBy.email) {
-          // Already populated, skip
-          return;
+    const projects = await Project.aggregate([
+      { $match: filter },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'createdBy',
+          foreignField: '_id',
+          as: 'createdByUser'
         }
-        
-        // Try to extract the ObjectId
-        let userId = null;
-        if (typeof project.createdBy === 'string') {
-          // It's a string ObjectId
-          if (mongoose.Types.ObjectId.isValid(project.createdBy)) {
-            userId = project.createdBy;
-          }
-        } else if (project.createdBy._id) {
-          // It's an object with _id property
-          userId = project.createdBy._id.toString();
-        } else if (mongoose.Types.ObjectId.isValid(project.createdBy)) {
-          // It's an ObjectId object
-          userId = project.createdBy.toString();
+      },
+      {
+        $unwind: {
+          path: '$createdByUser',
+          preserveNullAndEmptyArrays: true
         }
-        
-        if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-          userIdsToFetch.push(userId);
-        }
-      }
-    });
-    
-    // Fetch users if we have any unpopulated createdBy fields
-    if (userIdsToFetch.length > 0) {
-      const uniqueUserIds = [...new Set(userIdsToFetch)];
-      const users = await User.find({ _id: { $in: uniqueUserIds } }).select('name email').lean();
-      const userMap = new Map(users.map(u => [u._id.toString(), { name: u.name, email: u.email }]));
-      
-      // Update projects with user data
-      projects.forEach(project => {
-        if (project.createdBy && !project.createdBy.name && !project.createdBy.email) {
-          // Not populated yet, try to populate
-          let userId = null;
-          if (typeof project.createdBy === 'string') {
-            userId = project.createdBy;
-          } else if (project.createdBy._id) {
-            userId = project.createdBy._id.toString();
-          } else if (mongoose.Types.ObjectId.isValid(project.createdBy)) {
-            userId = project.createdBy.toString();
-          }
-          
-          if (userId) {
-            const user = userMap.get(userId);
-            if (user) {
-              project.createdBy = user;
-            } else {
-              // User not found, keep the ObjectId or set to null
-              project.createdBy = null;
+      },
+      {
+        $project: {
+          companyName: 1,
+          website: 1,
+          city: 1,
+          country: 1,
+          industry: 1,
+          companySize: 1,
+          companyDescription: 1,
+          contactPerson: 1,
+          campaignDetails: 1,
+          channels: 1,
+          icpDefinition: 1,
+          assignedTo: 1,
+          teamAllocation: 1,
+          status: 1,
+          createdAt: 1,
+          updatedAt: 1,
+          createdBy: {
+            $cond: {
+              if: { $ne: ['$createdByUser', null] },
+              then: {
+                name: '$createdByUser.name',
+                email: '$createdByUser.email'
+              },
+              else: null
             }
           }
         }
-      });
-    }
+      },
+      { $sort: { createdAt: -1 } }
+    ]);
 
     res.json({
       success: true,
@@ -238,8 +682,18 @@ router.get('/', authenticate, async (req, res) => {
 // Get a single project
 router.get('/:id', authenticate, async (req, res) => {
   try {
+    const projectId = req.params.id;
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
     const project = await Project.findOne({
-      _id: req.params.id
+      _id: projectId
     }).lean();
 
     if (!project) {
@@ -400,43 +854,144 @@ const calculateMatchScore = (contact, icpDefinition) => {
 // Get imported contacts for a project (only contacts already linked to project)
 router.get('/:id/project-contacts', authenticate, async (req, res) => {
   try {
-    const project = await Project.findOne({
-      _id: req.params.id
-    }).lean();
+    const projectId = req.params.id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 1000; // Default to 1000, can be increased if needed
+    const skip = (page - 1) * limit;
 
-    if (!project) {
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
+    // Use aggregation for better performance with large datasets
+    const projectObjectId = new mongoose.Types.ObjectId(projectId);
+    
+    // Check if project exists (lightweight check)
+    const projectExists = await Project.exists({ _id: projectObjectId });
+    if (!projectExists) {
       return res.status(404).json({
         success: false,
         error: 'Project not found'
       });
     }
 
-    // Get imported contacts for this project
-    const importedProjectContacts = await ProjectContact.find({ projectId: project._id })
-      .populate('contactId', 'name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
-      .lean();
+    // Use aggregation pipeline for better performance
+    // This avoids the N+1 query problem of populate()
+    const pipeline = [
+      // Match project contacts
+      {
+        $match: { projectId: projectObjectId }
+      },
+      // Lookup prospect contacts
+      {
+        $lookup: {
+          from: PROSPECT_CONTACT_COLLECTION, // MongoDB collection name (dynamically retrieved)
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'contact'
+        }
+      },
+      // Unwind the contact array (should be single contact)
+      {
+        $unwind: {
+          path: '$contact',
+          preserveNullAndEmptyArrays: false // Only include if contact exists
+        }
+      },
+      // Project only needed fields
+      {
+        $project: {
+          _id: '$contact._id',
+          name: '$contact.name',
+          title: '$contact.title',
+          company: '$contact.company',
+          email: '$contact.email',
+          firstPhone: '$contact.firstPhone',
+          category: '$contact.category',
+          industry: '$contact.industry',
+          keywords: '$contact.keywords',
+          city: '$contact.city',
+          state: '$contact.state',
+          country: '$contact.country',
+          companyCity: '$contact.companyCity',
+          companyState: '$contact.companyState',
+          companyCountry: '$contact.companyCountry',
+          personLinkedinUrl: '$contact.personLinkedinUrl',
+          companyLinkedinUrl: '$contact.companyLinkedinUrl',
+          website: '$contact.website',
+          employees: '$contact.employees',
+          projectContactId: '$_id',
+          stage: { $ifNull: ['$stage', 'New'] },
+          assignedTo: { $ifNull: ['$assignedTo', ''] },
+          priority: { $ifNull: ['$priority', 'Medium'] },
+          isImported: { $literal: true },
+          matchType: { $literal: 'imported' }
+        }
+      },
+      // Sort by creation date (newest first)
+      {
+        $sort: { _id: -1 }
+      }
+    ];
 
-    // Format contacts
-    const contacts = importedProjectContacts
-      .filter(pc => pc.contactId && pc.contactId._id)
-      .map(pc => {
-        const contact = { ...pc.contactId };
-        contact._id = pc.contactId._id;
-        contact.projectContactId = pc._id;
-        contact.stage = pc.stage || 'New';
-        contact.assignedTo = pc.assignedTo || '';
-        contact.priority = pc.priority || 'Medium';
-        contact.isImported = true;
-        contact.matchType = 'imported';
-        return contact;
-      });
+    // Get total count for pagination
+    const countPipeline = [
+      { $match: { projectId: projectObjectId } },
+      {
+        $lookup: {
+          from: 'prospectcontacts',
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'contact'
+        }
+      },
+      {
+        $unwind: {
+          path: '$contact',
+          preserveNullAndEmptyArrays: false
+        }
+      },
+      { $count: 'total' }
+    ];
+
+    // Execute queries in parallel
+    const [contactsResult, countResult] = await Promise.all([
+      ProjectContact.aggregate([
+        ...pipeline,
+        { $skip: skip },
+        { $limit: limit }
+      ]),
+      ProjectContact.aggregate(countPipeline)
+    ]);
+
+    const total = countResult[0]?.total || 0;
+    const totalPages = Math.ceil(total / limit);
 
     res.json({
       success: true,
-      data: contacts
+      data: contactsResult,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages
+      }
     });
   } catch (error) {
     console.error('Error fetching project contacts:', error);
+    
+    // Provide more specific error messages
+    if (error.code === 'ECONNRESET' || error.message.includes('connection')) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database connection was interrupted. Please try again.'
+      });
+    }
+    
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch project contacts'
@@ -447,8 +1002,18 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
 // Get similar contacts for a project
 router.get('/:id/similar-contacts', authenticate, async (req, res) => {
   try {
+    const projectId = req.params.id;
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
     const project = await Project.findOne({
-      _id: req.params.id
+      _id: projectId
     }).lean();
 
     if (!project) {
@@ -475,24 +1040,52 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
     );
 
     if (!hasICP) {
-      // Return only imported contacts if no ICP is defined
-      const importedProjectContacts = await ProjectContact.find({ projectId: project._id })
-        .populate('contactId', 'name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
-        .lean();
+      // Return only imported contacts if no ICP is defined (use aggregation for better performance)
+      const projectObjectId = new mongoose.Types.ObjectId(projectId);
+      const importedProjectContacts = await ProjectContact.aggregate([
+        { $match: { projectId: projectObjectId } },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'contact'
+          }
+        },
+        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: false } },
+        {
+          $project: {
+            _id: '$contact._id',
+            name: '$contact.name',
+            title: '$contact.title',
+            company: '$contact.company',
+            email: '$contact.email',
+            firstPhone: '$contact.firstPhone',
+            category: '$contact.category',
+            industry: '$contact.industry',
+            keywords: '$contact.keywords',
+            city: '$contact.city',
+            state: '$contact.state',
+            country: '$contact.country',
+            companyCity: '$contact.companyCity',
+            companyState: '$contact.companyState',
+            companyCountry: '$contact.companyCountry',
+            personLinkedinUrl: '$contact.personLinkedinUrl',
+            companyLinkedinUrl: '$contact.companyLinkedinUrl',
+            website: '$contact.website',
+            employees: '$contact.employees',
+            projectContactId: '$_id',
+            stage: { $ifNull: ['$stage', 'New'] },
+            assignedTo: { $ifNull: ['$assignedTo', ''] },
+            priority: { $ifNull: ['$priority', 'Medium'] },
+            isImported: { $literal: true },
+            matchType: { $literal: 'imported' }
+          }
+        }
+      ]);
 
-      const contacts = importedProjectContacts
-        .filter(pc => pc.contactId && pc.contactId._id)
-        .map(pc => {
-          const contact = { ...pc.contactId };
-          contact._id = pc.contactId._id;
-          contact.projectContactId = pc._id;
-          contact.stage = pc.stage || 'New';
-          contact.assignedTo = pc.assignedTo || '';
-          contact.priority = pc.priority || 'Medium';
-          contact.isImported = true;
-          contact.matchType = 'imported';
-          return contact;
-        });
+      // Contacts are already formatted by aggregation pipeline
+      const contacts = importedProjectContacts;
 
       return res.json({
         success: true,
@@ -562,23 +1155,52 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
 
     // If no ICP criteria found, return only imported contacts (don't show suggestions)
     if (orConditions.length === 0) {
-      const importedProjectContacts = await ProjectContact.find({ projectId: project._id })
-        .populate('contactId', 'name title company email firstPhone category industry keywords city state country companyCity companyState companyCountry personLinkedinUrl companyLinkedinUrl website employees')
-        .lean();
+      // Use aggregation for better performance
+      const projectObjectId = new mongoose.Types.ObjectId(projectId);
+      const importedProjectContacts = await ProjectContact.aggregate([
+        { $match: { projectId: projectObjectId } },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'contact'
+          }
+        },
+        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: false } },
+        {
+          $project: {
+            _id: '$contact._id',
+            name: '$contact.name',
+            title: '$contact.title',
+            company: '$contact.company',
+            email: '$contact.email',
+            firstPhone: '$contact.firstPhone',
+            category: '$contact.category',
+            industry: '$contact.industry',
+            keywords: '$contact.keywords',
+            city: '$contact.city',
+            state: '$contact.state',
+            country: '$contact.country',
+            companyCity: '$contact.companyCity',
+            companyState: '$contact.companyState',
+            companyCountry: '$contact.companyCountry',
+            personLinkedinUrl: '$contact.personLinkedinUrl',
+            companyLinkedinUrl: '$contact.companyLinkedinUrl',
+            website: '$contact.website',
+            employees: '$contact.employees',
+            projectContactId: '$_id',
+            stage: { $ifNull: ['$stage', 'New'] },
+            assignedTo: { $ifNull: ['$assignedTo', ''] },
+            priority: { $ifNull: ['$priority', 'Medium'] },
+            isImported: { $literal: true },
+            matchType: { $literal: 'imported' }
+          }
+        }
+      ]);
 
-      const contacts = importedProjectContacts
-        .filter(pc => pc.contactId && pc.contactId._id)
-        .map(pc => {
-          const contact = { ...pc.contactId };
-          contact._id = pc.contactId._id;
-          contact.projectContactId = pc._id;
-          contact.stage = pc.stage || 'New';
-          contact.assignedTo = pc.assignedTo || '';
-          contact.priority = pc.priority || 'Medium';
-          contact.isImported = true;
-          contact.matchType = 'imported';
-          return contact;
-        });
+      // Contacts are already formatted by aggregation pipeline
+      const contacts = importedProjectContacts;
 
       return res.json({
         success: true,
@@ -627,14 +1249,14 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
     const importedContactIds = new Set();
     
     importedProjectContacts.forEach(pc => {
-      if (pc.contactId && pc.contactId._id) {
-        const contactId = pc.contactId._id.toString();
+      if (pc._id) {
+        const contactId = pc._id.toString();
         importedContactIds.add(contactId);
         importedContactMap.set(contactId, {
           stage: pc.stage,
           assignedTo: pc.assignedTo,
           priority: pc.priority,
-          projectContactId: pc._id
+          projectContactId: pc.projectContactId
         });
       }
     });
@@ -655,20 +1277,13 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
       .lean();
 
     // Start with imported contacts (these are priority and always shown)
-    const allContacts = importedProjectContacts
-      .filter(pc => pc.contactId && pc.contactId._id)
-      .map(pc => {
-        const contact = { ...pc.contactId };
-        contact._id = pc.contactId._id;
-        contact.projectContactId = pc._id;
-        contact.stage = pc.stage || 'New';
-        contact.assignedTo = pc.assignedTo || '';
-        contact.priority = pc.priority || 'Medium';
-        contact.isImported = true;
-        contact.matchType = 'imported';
-        contact.matchScore = 100; // Imported contacts have highest priority
-        return contact;
-      });
+    // Contacts are already formatted by aggregation pipeline
+    const allContacts = importedProjectContacts.map(pc => ({
+      ...pc,
+      isImported: true,
+      matchType: 'imported',
+      matchScore: 100 // Imported contacts have highest priority
+    }));
 
     // Calculate match scores and add similar contacts from databank
     // Use batch processing to avoid blocking
@@ -768,6 +1383,16 @@ router.get('/:id/similar-contacts', authenticate, async (req, res) => {
 // Update a project
 router.put('/:id', authenticate, async (req, res) => {
   try {
+    const projectId = req.params.id;
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
     const {
       companyName,
       website,
@@ -786,7 +1411,7 @@ router.put('/:id', authenticate, async (req, res) => {
     } = req.body;
 
     const project = await Project.findOne({
-      _id: req.params.id,
+      _id: projectId,
       createdBy: req.user._id
     });
 
@@ -882,8 +1507,18 @@ router.put('/:id', authenticate, async (req, res) => {
 // Delete a project
 router.delete('/:id', authenticate, async (req, res) => {
   try {
+    const projectId = req.params.id;
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
     const project = await Project.findOneAndDelete({
-      _id: req.params.id,
+      _id: projectId,
       createdBy: req.user._id
     });
 
@@ -907,6 +1542,353 @@ router.delete('/:id', authenticate, async (req, res) => {
   }
 });
 
+// Helper function to normalize column names (removes spaces, special chars, converts to lowercase)
+function normalizeColumnName(name) {
+  if (!name) return '';
+  return name.trim().toLowerCase()
+    .replace(/#/g, '') // Remove # symbol
+    .replace(/\*/g, '') // Remove * symbol
+    .replace(/\s+/g, '') // Remove all spaces
+    .replace(/[_-]/g, '') // Remove underscores and hyphens
+    .replace(/\./g, '') // Remove dots
+    .replace(/[^\w]/g, ''); // Remove any other non-word characters
+}
+
+// Map normalized column names to our schema fields (with multiple variations)
+const columnMapping = {
+  // Name variations
+  'name': 'name',
+  'fullname': 'name',
+  'contactname': 'name',
+  'personname': 'name',
+  'fullname': 'name',
+  'contact': 'name',
+  'person': 'name',
+  'firstnamelastname': 'name',
+  'first name last name': 'name',
+  
+  // First Name (separate field)
+  'firstname': 'firstname',
+  'first name': 'firstname',
+  
+  // Last Name (separate field)
+  'lastname': 'lastname',
+  'last name': 'lastname',
+  
+  // Title variations
+  'title': 'title',
+  'jobtitle': 'title',
+  'job title': 'title',
+  'position': 'title',
+  'designation': 'title',
+  '*designation': 'title',
+  'role': 'title',
+  'job': 'title',
+  'jobposition': 'title',
+  'job position': 'title',
+  'jobrole': 'title',
+  'job role': 'title',
+  'positiontitle': 'title',
+  'position title': 'title',
+  
+  // Company variations
+  'company': 'company',
+  'companyname': 'company',
+  'company name': 'company',
+  'organization': 'company',
+  'org': 'company',
+  'firm': 'company',
+  'business': 'company',
+  'corporation': 'company',
+  'corp': 'company',
+  'companyname': 'company',
+  'organizationname': 'company',
+  'organization name': 'company',
+  
+  // Email variations
+  'email': 'email',
+  'emailaddress': 'email',
+  'email address': 'email',
+  'mail': 'email',
+  'e-mail': 'email',
+  'emailid': 'email',
+  'email id': 'email',
+  'e mail': 'email',
+  'emailaddress': 'email',
+  
+  // Phone variations
+  'firstphone': 'firstPhone',
+  'first phone': 'firstPhone',
+  'firstphone#': 'firstPhone', // For "First Phone #" header
+  'first phone #': 'firstPhone',
+  'phone': 'firstPhone',
+  'phonenumber': 'firstPhone',
+  'phone number': 'firstPhone',
+  'contactnumber': 'firstPhone',
+  'contact number': 'firstPhone',
+  'mobilenumber': 'firstPhone',
+  'mobile number': 'firstPhone',
+  'mobile': 'firstPhone',
+  'telephone': 'firstPhone',
+  'tel': 'firstPhone',
+  'cell': 'firstPhone',
+  'cellphone': 'firstPhone',
+  'cell phone': 'firstPhone',
+  
+  // Employees variations
+  'employees': 'employees',
+  'noofemployees': 'employees',
+  'numberofemployees': 'employees',
+  'employee': 'employees',
+  'emp': 'employees',
+  'employeecount': 'employees',
+  'companysize': 'employees',
+  '# employees': 'employees',
+  '#employees': 'employees',
+  'employees': 'employees',
+  'no of employees': 'employees',
+  'number of employees': 'employees',
+  
+  // Category
+  'category': 'category',
+  'cat': 'category',
+  'type': 'category',
+  'campaign': 'category', // Some CSVs use Campaign? column
+  
+  // Industry
+  'industry': 'industry',
+  'sector': 'industry',
+  'businesssector': 'industry',
+  'business sector': 'industry',
+  
+  // Keywords
+  'keywords': 'keywords',
+  'keyword': 'keywords',
+  'tags': 'keywords',
+  'tag': 'keywords',
+  
+  // LinkedIn URLs - comprehensive variations
+  'personlinkedinurl': 'personLinkedinUrl',
+  'personlinkedin': 'personLinkedinUrl',
+  'personlin': 'personLinkedinUrl', // For "Person Lin" header
+  'linkedinurl': 'personLinkedinUrl',
+  'linkedin': 'personLinkedinUrl',
+  'linkedinprofile': 'personLinkedinUrl',
+  'personlinkedinprofile': 'personLinkedinUrl',
+  'linkedinprofileurl': 'personLinkedinUrl',
+  'person linkedin url': 'personLinkedinUrl',
+  'person linkedin': 'personLinkedinUrl',
+  'linkedin url': 'personLinkedinUrl',
+  'linkedin profile': 'personLinkedinUrl',
+  'person linkedin profile': 'personLinkedinUrl',
+  'person linkedinprofile': 'personLinkedinUrl',
+  'personlinkedin url': 'personLinkedinUrl',
+  'person linkedinurl': 'personLinkedinUrl',
+  'linkedinprofile url': 'personLinkedinUrl',
+  'linkedin profile url': 'personLinkedinUrl',
+  'person linkedin profile url': 'personLinkedinUrl',
+  // Case variations
+  'linkedin': 'personLinkedinUrl',
+  'linkedinurl': 'personLinkedinUrl',
+  'linkedin url': 'personLinkedinUrl',
+  'linkedinprofile': 'personLinkedinUrl',
+  'personlinkedin': 'personLinkedinUrl',
+  'person linkedin': 'personLinkedinUrl',
+  'personlinkedinurl': 'personLinkedinUrl',
+  'person linkedin url': 'personLinkedinUrl',
+  
+  // Website
+  'website': 'website',
+  'web': 'website',
+  'url': 'website',
+  'websiteurl': 'website',
+  'site': 'website',
+  'webaddress': 'website',
+  
+  // Company LinkedIn
+  'companylinkedinurl': 'companyLinkedinUrl',
+  'companylinkedin': 'companyLinkedinUrl',
+  'companylinkedinprofile': 'companyLinkedinUrl',
+  'companylinkedinurl': 'companyLinkedinUrl',
+  
+  // Social Media
+  'facebookurl': 'facebookUrl',
+  'facebook': 'facebookUrl',
+  'fb': 'facebookUrl',
+  'fburl': 'facebookUrl',
+  'twitterurl': 'twitterUrl',
+  'twitter': 'twitterUrl',
+  'x': 'twitterUrl',
+  'twitterurl': 'twitterUrl',
+  
+  // Location
+  'city': 'city',
+  'personcity': 'city',
+  'location': 'city',
+  'state': 'state',
+  'personstate': 'state',
+  'province': 'state',
+  'region': 'state',
+  'country': 'country',
+  'personcountry': 'country',
+  'nation': 'country',
+  
+  // Company Address
+  'companyaddress': 'companyAddress',
+  'address': 'companyAddress',
+  'companyaddr': 'companyAddress',
+  'companyaddress': 'companyAddress',
+  'companycity': 'companyCity',
+  'companystate': 'companyState',
+  'companycountry': 'companyCountry',
+  'companyphone': 'companyPhone',
+  'companyphonenumber': 'companyPhone',
+  'companytel': 'companyPhone',
+  'companytelephone': 'companyPhone',
+  
+  // Additional fields
+  'seodescription': 'seoDescription',
+  'seodescr': 'seoDescription', // For "SEO Descr" header
+  'description': 'seoDescription',
+  'about': 'seoDescription',
+  'companydescription': 'seoDescription',
+  'bio': 'seoDescription',
+  'technologies': 'technologies',
+  'tech': 'technologies',
+  'technology': 'technologies',
+  'techstack': 'technologies',
+  'annualrevenue': 'annualRevenue',
+  'revenue': 'annualRevenue',
+  'annualrevenue': 'annualRevenue',
+  'yearlyrevenue': 'annualRevenue'
+};
+
+// Function to find the best matching field for a column name
+function findMatchingField(columnName) {
+  if (!columnName || typeof columnName !== 'string') {
+    return null;
+  }
+  
+  const normalized = normalizeColumnName(columnName);
+  const lowerColumn = columnName.toLowerCase().trim();
+  
+  // Direct match with normalized key
+  if (columnMapping[normalized]) {
+    return columnMapping[normalized];
+  }
+  
+  // Direct match with lowercase key (handles case variations)
+  if (columnMapping[lowerColumn]) {
+    return columnMapping[lowerColumn];
+  }
+  
+  // Remove common separators and try again
+  const noSeparators = lowerColumn.replace(/[_\-\s\.]/g, '');
+  if (columnMapping[noSeparators]) {
+    return columnMapping[noSeparators];
+  }
+  
+  // Partial match - check if normalized column contains any key or vice versa
+  // Prioritize longer matches first
+  const sortedKeys = Object.keys(columnMapping).sort((a, b) => b.length - a.length);
+  for (const key of sortedKeys) {
+    const keyLower = key.toLowerCase();
+    const normalizedLower = normalized.toLowerCase();
+    
+    // Check if column contains key or key contains column (with minimum length)
+    if ((normalizedLower.includes(keyLower) || keyLower.includes(normalizedLower)) && 
+        (key.length >= 3 || normalized.length >= 3)) {
+      return columnMapping[key];
+    }
+    
+    // Also check without separators
+    const keyNoSep = keyLower.replace(/[_\-\s\.]/g, '');
+    const colNoSep = normalizedLower.replace(/[_\-\s\.]/g, '');
+    if ((colNoSep.includes(keyNoSep) || keyNoSep.includes(colNoSep)) && 
+        (keyNoSep.length >= 3 || colNoSep.length >= 3)) {
+      return columnMapping[key];
+    }
+  }
+  
+  // Special handling for LinkedIn variations (case-insensitive, with/without spaces)
+  const linkedinPatterns = [
+    /linkedin/i,
+    /linked\s*in/i,
+    /lin\s*url/i,
+    /linkedin\s*profile/i,
+    /linkedin\s*url/i
+  ];
+  
+  const isLinkedInField = linkedinPatterns.some(pattern => pattern.test(columnName));
+  if (isLinkedInField) {
+    // Check if it's person or company LinkedIn
+    const isPersonLinkedIn = /person/i.test(columnName) || !/company/i.test(columnName);
+    if (isPersonLinkedIn) {
+      return 'personLinkedinUrl';
+    } else {
+      return 'companyLinkedinUrl';
+    }
+  }
+  
+  return null;
+}
+
+// Helper function to extract field value from normalized row using flexible matching
+function extractFieldValue(normalizedRow, fieldName, additionalVariations = [], originalRow = null) {
+  // First, try to find matching field using column mapping by checking all keys in normalizedRow
+  // Prioritize longer keys first (more specific matches)
+  const sortedKeys = Object.keys(normalizedRow).sort((a, b) => b.length - a.length);
+  for (const key of sortedKeys) {
+    const value = normalizedRow[key];
+    // Allow empty strings but skip undefined and null
+    if (value === undefined || value === null) continue;
+    const matchedField = findMatchingField(key);
+    if (matchedField === fieldName) {
+      // Return the value as string, preserving empty strings
+      return value !== undefined && value !== null ? String(value) : '';
+    }
+  }
+  
+  // Also check original row keys if provided (for exact matches and case variations)
+  if (originalRow) {
+    const sortedOriginalKeys = Object.keys(originalRow).sort((a, b) => b.length - a.length);
+    for (const key of sortedOriginalKeys) {
+      const value = originalRow[key];
+      // Allow empty strings but skip undefined and null
+      if (value === undefined || value === null) continue;
+      const matchedField = findMatchingField(key);
+      if (matchedField === fieldName) {
+        // Return the value as string, preserving empty strings
+        return value !== undefined && value !== null ? String(value) : '';
+      }
+    }
+  }
+  
+  // Also try direct normalized variations (with all possible normalizations)
+  const allVariations = [fieldName, ...additionalVariations];
+  for (const variation of allVariations) {
+    // Try multiple normalization approaches
+    const normalized = normalizeColumnName(variation);
+    if (normalizedRow[normalized] !== undefined && normalizedRow[normalized] !== null) {
+      return String(normalizedRow[normalized]);
+    }
+    
+    // Try lowercase version
+    const lowerVariation = variation.toLowerCase().trim();
+    if (normalizedRow[lowerVariation] !== undefined && normalizedRow[lowerVariation] !== null) {
+      return String(normalizedRow[lowerVariation]);
+    }
+    
+    // Try without separators
+    const noSepVariation = lowerVariation.replace(/[_\-\s\.]/g, '');
+    if (normalizedRow[noSepVariation] !== undefined && normalizedRow[noSepVariation] !== null) {
+      return String(normalizedRow[noSepVariation]);
+    }
+  }
+  
+  return '';
+}
+
 // Bulk import prospects
 router.post('/bulk-import', authenticate, upload.single('file'), async (req, res) => {
   try {
@@ -923,6 +1905,14 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       return res.status(400).json({
         success: false,
         error: 'Project ID is required'
+      });
+    }
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
       });
     }
 
@@ -947,93 +1937,196 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
     if (isExcel) {
       // Parse Excel file
       try {
-        const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+        const workbook = XLSX.read(req.file.buffer, { 
+          type: 'buffer',
+          cellDates: false,
+          cellNF: false,
+          cellText: false,
+          raw: false,
+          codepage: 65001 // UTF-8
+        });
         const sheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[sheetName];
-        const rows = XLSX.utils.sheet_to_json(worksheet);
+        const rows = XLSX.utils.sheet_to_json(worksheet, {
+          defval: '', // Default value for empty cells
+          raw: false // Convert all values to strings
+        });
         
         rows.forEach((row, index) => {
-          const rowNumber = index + 1;
-          
-          // Normalize column names (case-insensitive)
-          const normalizedRow = {};
-          Object.keys(row).forEach(key => {
-            normalizedRow[key.toLowerCase().trim()] = row[key];
-          });
+          try {
+            const rowNumber = index + 1;
+            
+            // Normalize column names (case-insensitive and remove spaces/special chars)
+            // Store all possible variations for flexible matching
+            const normalizedRow = {};
+            Object.keys(row).forEach(key => {
+              const value = row[key];
+              // Allow empty strings, only skip undefined and null
+              if (value === undefined || value === null) return;
+              
+              // Convert value to string for consistent handling
+              const stringValue = value.toString();
+              
+              // Store with fully normalized key (no spaces, no special chars, lowercase)
+              const fullyNormalized = normalizeColumnName(key);
+              normalizedRow[fullyNormalized] = stringValue;
+              
+              // Store with spaces removed but lowercase
+              const spaceRemoved = key.toLowerCase().trim().replace(/\s+/g, '');
+              if (spaceRemoved && spaceRemoved !== fullyNormalized) {
+                normalizedRow[spaceRemoved] = stringValue;
+              }
+              
+              // Store original lowercase trimmed version
+              const lowerTrimmed = key.toLowerCase().trim();
+              if (lowerTrimmed && lowerTrimmed !== fullyNormalized && lowerTrimmed !== spaceRemoved) {
+                normalizedRow[lowerTrimmed] = stringValue;
+              }
+              
+              // Also store original key (for exact matches)
+              normalizedRow[key] = stringValue;
+            });
 
-          // Get values with case-insensitive matching for all fields
-          const name = normalizedRow['name'] || '';
-          const email = normalizedRow['email'] || '';
-          const company = normalizedRow['company'] || '';
-          const title = normalizedRow['title'] || '';
-          const firstPhone = normalizedRow['first phone'] || normalizedRow['firstphone'] || normalizedRow['phone'] || '';
-          const employees = normalizedRow['employees'] || '';
-          const category = normalizedRow['category'] || '';
-          const industry = normalizedRow['industry'] || '';
-          const keywords = normalizedRow['keywords'] || '';
-          const personLinkedinUrl = normalizedRow['person linkedin url'] || normalizedRow['personlinkedinurl'] || 
-                                   normalizedRow['linkedin'] || normalizedRow['linkedinurl'] || 
-                                   normalizedRow['linkedin url'] || normalizedRow['linkedin profile'] || 
-                                   normalizedRow['linkedinprofile'] || '';
-          const website = normalizedRow['website'] || '';
-          const companyLinkedinUrl = normalizedRow['company linkedin url'] || normalizedRow['companylinkedinurl'] || '';
-          const facebookUrl = normalizedRow['facebook url'] || normalizedRow['facebookurl'] || '';
-          const twitterUrl = normalizedRow['twitter url'] || normalizedRow['twitterurl'] || '';
-          const city = normalizedRow['city'] || '';
-          const state = normalizedRow['state'] || '';
-          const country = normalizedRow['country'] || '';
-          const companyAddress = normalizedRow['company address'] || normalizedRow['companyaddress'] || '';
-          const companyCity = normalizedRow['company city'] || normalizedRow['companycity'] || '';
-          const companyState = normalizedRow['company state'] || normalizedRow['companystate'] || '';
-          const companyCountry = normalizedRow['company country'] || normalizedRow['companycountry'] || '';
-          const companyPhone = normalizedRow['company phone'] || normalizedRow['companyphone'] || '';
-          const seoDescription = normalizedRow['seo description'] || normalizedRow['seodescription'] || '';
-          const technologies = normalizedRow['technologies'] || '';
-          const annualRevenue = normalizedRow['annual revenue'] || normalizedRow['annualrevenue'] || '';
+            // Get values using flexible field matching (pass original row for additional matching)
+            // Handle First Name + Last Name combination for name field
+            // Try to get Name field first
+            const fullName = extractFieldValue(normalizedRow, 'name', ['fullname', 'contactname', 'personname', 'full name', 'contact name', 'person name', 'name'], row);
+            // Try to get First Name and Last Name separately
+            const firstName = extractFieldValue(normalizedRow, 'firstname', ['firstname', 'first name'], row);
+            const lastName = extractFieldValue(normalizedRow, 'lastname', ['lastname', 'last name'], row);
+            
+            let name = '';
+            // Priority: Use full Name if available, otherwise combine First + Last
+            if (fullName && fullName.trim()) {
+              name = fullName.trim();
+            } else if ((firstName && firstName.trim()) || (lastName && lastName.trim())) {
+              const first = firstName && firstName.trim() ? firstName.trim() : '';
+              const last = lastName && lastName.trim() ? lastName.trim() : '';
+              name = [first, last].filter(Boolean).join(' ').trim();
+            }
+            
+            // If still no name, try to find it in any column that might contain a name
+            if (!name || !name.trim()) {
+              // Check original row for any field that might be a name
+              for (const [key, value] of Object.entries(row)) {
+                const keyLower = key.toLowerCase().trim();
+                if ((keyLower.includes('name') || keyLower.includes('contact') || keyLower.includes('person')) && 
+                    value && String(value).trim()) {
+                  name = String(value).trim();
+                  break;
+                }
+              }
+            }
+            
+            const email = extractFieldValue(normalizedRow, 'email', ['emailaddress', 'email address', 'e-mail', 'mail'], row);
+            const company = extractFieldValue(normalizedRow, 'company', ['companyname', 'company name', 'organization', 'org', 'firm'], row);
+            const title = extractFieldValue(normalizedRow, 'title', ['jobtitle', 'job title', 'position', 'designation', '*designation', 'role'], row);
+            const firstPhone = extractFieldValue(normalizedRow, 'firstPhone', ['firstphone', 'first phone', 'first phone #', 'firstphone#', 'phone', 'phonenumber', 'phone number', 'contactnumber', 'contact number', 'mobilenumber', 'mobile number', 'mobile', 'telephone', 'tel', 'cell', 'cellphone'], row);
+            const employees = extractFieldValue(normalizedRow, 'employees', ['noofemployees', 'no of employees', 'numberofemployees', 'number of employees', 'employee', 'emp', 'employeecount', 'employee count', 'companysize', 'company size'], row);
+            const category = extractFieldValue(normalizedRow, 'category', ['cat', 'type'], row);
+            const industry = extractFieldValue(normalizedRow, 'industry', ['sector', 'businesssector', 'business sector'], row);
+            const keywords = extractFieldValue(normalizedRow, 'keywords', ['keyword', 'tags', 'tag'], row);
+            const personLinkedinUrl = extractFieldValue(normalizedRow, 'personLinkedinUrl', [
+              'personlinkedinurl', 'person linkedin url', 'personlinkedin', 'person linkedin', 
+              'person lin', 'personlin', 'linkedinurl', 'linkedin url', 'linkedin', 
+              'linkedinprofile', 'linkedin profile', 'personlinkedinprofile', 'person linkedin profile',
+              'LinkedIn', 'LinkedIn URL', 'LinkedIn Url', 'Person LinkedIn', 'Person LinkedIn URL',
+              'Person LinkedIn Url', 'LinkedIn Profile', 'Person LinkedIn Profile', 'LinkedInProfile',
+              'PersonLinkedIn', 'PersonLinkedInURL', 'PersonLinkedInUrl', 'linkedin', 'LinkedInURL'
+            ], row);
+            const website = extractFieldValue(normalizedRow, 'website', ['web', 'url', 'websiteurl', 'website url', 'site', 'webaddress', 'web address'], row);
+            const companyLinkedinUrl = extractFieldValue(normalizedRow, 'companyLinkedinUrl', ['companylinkedinurl', 'company linkedin url', 'companylinkedin', 'company linkedin', 'companylinkedinprofile', 'company linkedin profile'], row);
+            const facebookUrl = extractFieldValue(normalizedRow, 'facebookUrl', ['facebookurl', 'facebook url', 'facebook', 'fb', 'fburl', 'fb url'], row);
+            const twitterUrl = extractFieldValue(normalizedRow, 'twitterUrl', ['twitterurl', 'twitter url', 'twitter', 'x'], row);
+            const city = extractFieldValue(normalizedRow, 'city', ['personcity', 'person city', 'location'], row);
+            const state = extractFieldValue(normalizedRow, 'state', ['personstate', 'person state', 'province', 'region'], row);
+            const country = extractFieldValue(normalizedRow, 'country', ['personcountry', 'person country', 'nation'], row);
+            const companyAddress = extractFieldValue(normalizedRow, 'companyAddress', ['companyaddress', 'company address', 'address', 'companyaddr', 'company addr'], row);
+            const companyCity = extractFieldValue(normalizedRow, 'companyCity', ['companycity', 'company city'], row);
+            const companyState = extractFieldValue(normalizedRow, 'companyState', ['companystate', 'company state'], row);
+            const companyCountry = extractFieldValue(normalizedRow, 'companyCountry', ['companycountry', 'company country'], row);
+            const companyPhone = extractFieldValue(normalizedRow, 'companyPhone', ['companyphone', 'company phone', 'companyphonenumber', 'company phone number', 'companytel', 'company tel', 'companytelephone', 'company telephone'], row);
+            const seoDescription = extractFieldValue(normalizedRow, 'seoDescription', ['seodescription', 'seo description', 'seo descr', 'seodescr', 'description', 'about', 'companydescription', 'company description', 'bio'], row);
+            const technologies = extractFieldValue(normalizedRow, 'technologies', ['tech', 'technology', 'techstack', 'tech stack'], row);
+            const annualRevenue = extractFieldValue(normalizedRow, 'annualRevenue', ['annualrevenue', 'annual revenue', 'revenue', 'yearlyrevenue', 'yearly revenue'], row);
 
-          // Skip completely empty rows
-          const hasAnyData = name || email || company || title || firstPhone || employees || category || 
-                           industry || keywords || personLinkedinUrl || website || companyLinkedinUrl || 
-                           facebookUrl || twitterUrl || city || state || country || companyAddress || 
-                           companyCity || companyState || companyCountry || companyPhone || seoDescription || 
-                           technologies || annualRevenue;
-          if (!hasAnyData) {
-            return; // Skip empty rows silently
+            // Check if row has any data at all (from original row object)
+            const rowHasData = Object.values(row).some(val => val !== undefined && val !== null && String(val).trim() !== '');
+            
+            // Skip completely empty rows (check if ALL fields are empty)
+            // But be more lenient - if we have at least name, email, or company, process it
+            const hasAnyData = (name && name.toString().trim()) || (email && email.toString().trim()) || (company && company.toString().trim()) || 
+                             (title && title.toString().trim()) || (firstPhone && firstPhone.toString().trim()) || 
+                             (employees && employees.toString().trim()) || (category && category.toString().trim()) || 
+                             (industry && industry.toString().trim()) || (keywords && keywords.toString().trim()) || 
+                             (personLinkedinUrl && personLinkedinUrl.toString().trim()) || (website && website.toString().trim()) || 
+                             (companyLinkedinUrl && companyLinkedinUrl.toString().trim()) || (facebookUrl && facebookUrl.toString().trim()) || 
+                             (twitterUrl && twitterUrl.toString().trim()) || (city && city.toString().trim()) || (state && state.toString().trim()) || 
+                             (country && country.toString().trim()) || (companyAddress && companyAddress.toString().trim()) || 
+                             (companyCity && companyCity.toString().trim()) || (companyState && companyState.toString().trim()) || 
+                             (companyCountry && companyCountry.toString().trim()) || (companyPhone && companyPhone.toString().trim()) || 
+                             (seoDescription && seoDescription.toString().trim()) || (technologies && technologies.toString().trim()) || 
+                             (annualRevenue && annualRevenue.toString().trim());
+            
+            // If row has data but we couldn't map it, log for debugging
+            if (rowHasData && !hasAnyData) {
+              console.warn(`Excel Row ${rowNumber + 1} has data but couldn't map fields. Keys:`, Object.keys(row));
+              errors.push(`Row ${rowNumber + 1}: Data present but no mappable fields found`);
+            }
+            
+            if (!hasAnyData) {
+              return; // Skip empty rows silently
+            }
+
+            // Validate required fields
+            const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.toString().trim()) ? personLinkedinUrl.toString().trim() : '';
+            if (!trimmedPersonLinkedinUrl) {
+              errors.push(`Row ${rowNumber + 1}: Person Linkedin Url is required`);
+              return; // Skip this row
+            }
+
+            // Generate default values for required fields
+            // Handle empty strings properly - always create a contact if we have any data
+            // If we have email or company but no name, still create the contact
+            const trimmedName = (name && name.toString().trim()) ? name.toString().trim() : 
+              (email && email.toString().trim()) ? email.toString().trim().split('@')[0] : 
+              (company && company.toString().trim()) ? company.toString().trim() : 
+              `Contact ${rowNumber + 1}`;
+            let trimmedEmail = (email && email.toString().trim()) ? email.toString().trim().toLowerCase() : `contact${rowNumber + 1}@unknown.com`;
+            const trimmedCompany = (company && company.toString().trim()) ? company.toString().trim() : 'Unknown Company';
+
+            // Create contact object with all fields
+            contacts.push({
+              name: trimmedName,
+              email: trimmedEmail,
+              company: trimmedCompany,
+              title: (title && title.toString().trim()) ? title.toString().trim() : '',
+              firstPhone: (firstPhone && firstPhone.toString().trim()) ? firstPhone.toString().trim() : '',
+              employees: (employees && employees.toString().trim()) ? employees.toString().trim() : '',
+              category: (category && category.toString().trim()) ? category.toString().trim() : '',
+              industry: (industry && industry.toString().trim()) ? industry.toString().trim() : '',
+              keywords: (keywords && keywords.toString().trim()) ? keywords.toString().trim() : '',
+              personLinkedinUrl: trimmedPersonLinkedinUrl,
+              website: (website && website.toString().trim()) ? website.toString().trim() : '',
+              companyLinkedinUrl: (companyLinkedinUrl && companyLinkedinUrl.toString().trim()) ? companyLinkedinUrl.toString().trim() : '',
+              facebookUrl: (facebookUrl && facebookUrl.toString().trim()) ? facebookUrl.toString().trim() : '',
+              twitterUrl: (twitterUrl && twitterUrl.toString().trim()) ? twitterUrl.toString().trim() : '',
+              city: (city && city.toString().trim()) ? city.toString().trim() : '',
+              state: (state && state.toString().trim()) ? state.toString().trim() : '',
+              country: (country && country.toString().trim()) ? country.toString().trim() : '',
+              companyAddress: (companyAddress && companyAddress.toString().trim()) ? companyAddress.toString().trim() : '',
+              companyCity: (companyCity && companyCity.toString().trim()) ? companyCity.toString().trim() : '',
+              companyState: (companyState && companyState.toString().trim()) ? companyState.toString().trim() : '',
+              companyCountry: (companyCountry && companyCountry.toString().trim()) ? companyCountry.toString().trim() : '',
+              companyPhone: (companyPhone && companyPhone.toString().trim()) ? companyPhone.toString().trim() : '',
+              seoDescription: (seoDescription && seoDescription.toString().trim()) ? seoDescription.toString().trim() : '',
+              technologies: (technologies && technologies.toString().trim()) ? technologies.toString().trim() : '',
+              annualRevenue: (annualRevenue && annualRevenue.toString().trim()) ? annualRevenue.toString().trim() : ''
+            });
+          } catch (rowError) {
+            errors.push(`Row ${index + 2}: Error processing row - ${rowError.message}`);
+            console.error(`Error processing Excel row ${index + 2}:`, rowError);
           }
-
-          // Generate default values for required fields (no validation)
-          const trimmedName = name ? name.toString().trim() : `Contact ${rowNumber}`;
-          let trimmedEmail = email ? email.toString().trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
-          const trimmedCompany = company ? company.toString().trim() : 'Unknown Company';
-
-          // Create contact object with all fields (accept any data, no validation)
-          contacts.push({
-            name: trimmedName,
-            email: trimmedEmail,
-            company: trimmedCompany,
-            title: title ? title.toString().trim() : '',
-            firstPhone: firstPhone ? firstPhone.toString().trim() : '',
-            employees: employees ? employees.toString().trim() : '',
-            category: category ? category.toString().trim() : '',
-            industry: industry ? industry.toString().trim() : '',
-            keywords: keywords ? keywords.toString().trim() : '',
-            personLinkedinUrl: personLinkedinUrl ? personLinkedinUrl.toString().trim() : '',
-            website: website ? website.toString().trim() : '',
-            companyLinkedinUrl: companyLinkedinUrl ? companyLinkedinUrl.toString().trim() : '',
-            facebookUrl: facebookUrl ? facebookUrl.toString().trim() : '',
-            twitterUrl: twitterUrl ? twitterUrl.toString().trim() : '',
-            city: city ? city.toString().trim() : '',
-            state: state ? state.toString().trim() : '',
-            country: country ? country.toString().trim() : '',
-            companyAddress: companyAddress ? companyAddress.toString().trim() : '',
-            companyCity: companyCity ? companyCity.toString().trim() : '',
-            companyState: companyState ? companyState.toString().trim() : '',
-            companyCountry: companyCountry ? companyCountry.toString().trim() : '',
-            companyPhone: companyPhone ? companyPhone.toString().trim() : '',
-            seoDescription: seoDescription ? seoDescription.toString().trim() : '',
-            technologies: technologies ? technologies.toString().trim() : '',
-            annualRevenue: annualRevenue ? annualRevenue.toString().trim() : ''
-          });
         });
       } catch (excelError) {
         console.error('Error parsing Excel file:', excelError);
@@ -1043,145 +2136,416 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
         });
       }
     } else {
-      // Parse CSV file
-      const stream = Readable.from(req.file.buffer.toString());
+      // Parse CSV file with proper UTF-8 encoding handling
+      // Remove BOM if present and ensure UTF-8 encoding
+      let csvContent = req.file.buffer.toString('utf8');
+      // Remove UTF-8 BOM if present
+      if (csvContent.charCodeAt(0) === 0xFEFF) {
+        csvContent = csvContent.slice(1);
+      }
       
-      await new Promise((resolve, reject) => {
-        let rowNumber = 0;
-        stream
-          .pipe(csv())
-          .on('data', (row) => {
-            rowNumber++;
-            
-            // Normalize column names (case-insensitive)
-            const normalizedRow = {};
-            Object.keys(row).forEach(key => {
-              normalizedRow[key.toLowerCase().trim()] = row[key];
-            });
-
-            // Get values with case-insensitive matching for all fields
-            const name = normalizedRow['name'] || '';
-            const email = normalizedRow['email'] || '';
-            const company = normalizedRow['company'] || '';
-            const title = normalizedRow['title'] || '';
-            const firstPhone = normalizedRow['first phone'] || normalizedRow['firstphone'] || normalizedRow['phone'] || '';
-            const employees = normalizedRow['employees'] || '';
-            const category = normalizedRow['category'] || '';
-            const industry = normalizedRow['industry'] || '';
-            const keywords = normalizedRow['keywords'] || '';
-            const personLinkedinUrl = normalizedRow['person linkedin url'] || normalizedRow['personlinkedinurl'] || 
-                                     normalizedRow['linkedin'] || normalizedRow['linkedinurl'] || 
-                                     normalizedRow['linkedin url'] || normalizedRow['linkedin profile'] || 
-                                     normalizedRow['linkedinprofile'] || '';
-            const website = normalizedRow['website'] || '';
-            const companyLinkedinUrl = normalizedRow['company linkedin url'] || normalizedRow['companylinkedinurl'] || '';
-            const facebookUrl = normalizedRow['facebook url'] || normalizedRow['facebookurl'] || '';
-            const twitterUrl = normalizedRow['twitter url'] || normalizedRow['twitterurl'] || '';
-            const city = normalizedRow['city'] || '';
-            const state = normalizedRow['state'] || '';
-            const country = normalizedRow['country'] || '';
-            const companyAddress = normalizedRow['company address'] || normalizedRow['companyaddress'] || '';
-            const companyCity = normalizedRow['company city'] || normalizedRow['companycity'] || '';
-            const companyState = normalizedRow['company state'] || normalizedRow['companystate'] || '';
-            const companyCountry = normalizedRow['company country'] || normalizedRow['companycountry'] || '';
-            const companyPhone = normalizedRow['company phone'] || normalizedRow['companyphone'] || '';
-            const seoDescription = normalizedRow['seo description'] || normalizedRow['seodescription'] || '';
-            const technologies = normalizedRow['technologies'] || '';
-            const annualRevenue = normalizedRow['annual revenue'] || normalizedRow['annualrevenue'] || '';
-
-            // Skip completely empty rows
-            const hasAnyData = name || email || company || title || firstPhone || employees || category || 
-                             industry || keywords || personLinkedinUrl || website || companyLinkedinUrl || 
-                             facebookUrl || twitterUrl || city || state || country || companyAddress || 
-                             companyCity || companyState || companyCountry || companyPhone || seoDescription || 
-                             technologies || annualRevenue;
-            if (!hasAnyData) {
-              return; // Skip empty rows silently
+      // Detect delimiter (comma, tab, or semicolon)
+      const lines = csvContent.split('\n').filter(line => line.trim());
+      const firstLine = lines[0] || '';
+      const commaCount = (firstLine.match(/,/g) || []).length;
+      const tabCount = (firstLine.match(/\t/g) || []).length;
+      const semicolonCount = (firstLine.match(/;/g) || []).length;
+      
+      let delimiter = ',';
+      if (tabCount > commaCount && tabCount > semicolonCount && tabCount > 0) {
+        delimiter = '\t';
+      } else if (semicolonCount > commaCount && semicolonCount > tabCount && semicolonCount > 0) {
+        delimiter = ';';
+      }
+      
+      console.log(`CSV delimiter detected: ${delimiter === '\t' ? 'TAB' : delimiter === ';' ? 'SEMICOLON' : 'COMMA'}`);
+      console.log(`CSV first line preview: ${firstLine.substring(0, 200)}`);
+      console.log(`CSV total lines: ${lines.length}`);
+      console.log(`Delimiter counts - Comma: ${commaCount}, Tab: ${tabCount}, Semicolon: ${semicolonCount}`);
+      
+      // Parse headers manually from first line
+      // Handle quoted fields properly
+      const headerLine = firstLine;
+      const parseCSVLine = (line, sep) => {
+        const result = [];
+        let current = '';
+        let inQuotes = false;
+        
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i];
+          const nextChar = line[i + 1];
+          
+          if (char === '"') {
+            if (inQuotes && nextChar === '"') {
+              // Escaped quote
+              current += '"';
+              i++; // Skip next quote
+            } else {
+              // Toggle quote state
+              inQuotes = !inQuotes;
             }
+          } else if (char === sep && !inQuotes) {
+            // Field separator found outside quotes
+            result.push(current.trim());
+            current = '';
+          } else {
+            current += char;
+          }
+        }
+        // Add last field
+        result.push(current.trim());
+        return result;
+      };
+      
+      let headers = parseCSVLine(headerLine, delimiter).map(h => 
+        h.replace(/^\uFEFF/, '').replace(/^"|"$/g, '').trim()
+      );
+      console.log('CSV Headers parsed:', headers);
+      console.log('CSV Header count:', headers.length);
+      
+      // Parse CSV manually line by line for better control
+      const allLines = csvContent.split('\n').filter(line => line.trim());
+      
+      if (allLines.length < 2) {
+        return res.status(400).json({
+          success: false,
+          error: 'CSV file must have at least a header row and one data row'
+        });
+      }
+      
+      // Check if first data row contains header-like values (common column names)
+      // This handles cases where the actual headers are in the first data row or embedded in a cell
+      const firstDataRow = allLines[1];
+      let startRowIndex = 1;
+      
+      if (firstDataRow) {
+        const firstDataValues = parseCSVLine(firstDataRow, delimiter);
+        const firstDataRowText = firstDataValues.join(',').toLowerCase();
+        
+        // Check if first data row contains expected header names
+        const expectedHeaders = ['company', 'email', 'person linkedin url', 'name', 'title', 'designation', 'first phone', 'employees'];
+        const containsHeaders = expectedHeaders.some(header => 
+          firstDataRowText.includes(header.toLowerCase())
+        );
+        
+        // Check if any cell in the first data row contains multiple expected headers (comma-separated in one cell)
+        // This handles cases where headers are embedded in a single cell
+        let potentialHeaders = null;
+        for (const value of firstDataValues) {
+          if (value && typeof value === 'string' && value.trim()) {
+            const trimmedValue = value.trim();
+            const lowerValue = trimmedValue.toLowerCase();
+            
+            // Check if this value contains multiple expected headers (comma-separated)
+            const headerMatches = expectedHeaders.filter(h => lowerValue.includes(h.toLowerCase()));
+            if (headerMatches.length >= 3) {
+              // This cell likely contains the actual headers as a comma-separated string
+              // Split by comma and clean up
+              potentialHeaders = trimmedValue.split(',').map(h => {
+                // Remove quotes and trim
+                return h.replace(/^["']|["']$/g, '').trim();
+              }).filter(h => h.length > 0);
+              
+              // Verify these look like headers (should have at least 5-6 expected column names)
+              const potentialHeadersLower = potentialHeaders.map(h => h.toLowerCase());
+              const matchedExpected = expectedHeaders.filter(h => 
+                potentialHeadersLower.some(ph => ph.includes(h) || h.includes(ph))
+              );
+              
+              if (matchedExpected.length >= 3 && potentialHeaders.length >= 5) {
+                console.log('Detected headers embedded in first data row cell:', potentialHeaders);
+                headers = potentialHeaders.map(h => h.replace(/^\uFEFF/, '').replace(/^"|"$/g, '').trim());
+                console.log('Using extracted headers:', headers);
+                startRowIndex = 2; // Skip the row that contained headers
+                break;
+              }
+            }
+          }
+        }
+        
+        // If we didn't find headers in a cell, check if the first data row itself looks like headers
+        if (!potentialHeaders && containsHeaders && firstDataValues.length > 5) {
+          // Check if first data row values look like header names (not data)
+          const looksLikeHeaders = firstDataValues.some(val => {
+            if (!val || typeof val !== 'string') return false;
+            const lowerVal = val.toLowerCase().trim();
+            return expectedHeaders.some(h => lowerVal.includes(h) || h.includes(lowerVal));
+          });
+          
+          if (looksLikeHeaders) {
+            // Use first data row as headers
+            headers = firstDataValues.map(h => h.replace(/^\uFEFF/, '').replace(/^"|"$/g, '').trim());
+            console.log('Using first data row as headers:', headers);
+            startRowIndex = 2;
+          }
+        }
+      }
+      
+      // Process each data row (skip header row(s))
+      for (let i = startRowIndex; i < allLines.length; i++) {
+        try {
+          const line = allLines[i];
+          if (!line || !line.trim()) continue;
+          
+          const rowNumber = i + 1; // For error reporting (1-indexed, accounting for header row)
+          
+          // Parse the line using our custom parser
+          const values = parseCSVLine(line, delimiter);
+          
+          // Create mapped row object using headers
+          const mappedRow = {};
+          headers.forEach((header, index) => {
+            if (index < values.length) {
+              const value = values[index].replace(/^"|"$/g, '').trim();
+              if (value !== undefined && value !== null && value !== '') {
+                mappedRow[header] = value;
+              }
+            }
+          });
+          
+          // Log first data row for debugging
+          if (i === 1) {
+            console.log('CSV First data row keys:', Object.keys(mappedRow));
+            console.log('CSV First data row sample:', JSON.stringify(mappedRow).substring(0, 500));
+            console.log('CSV First data row values:', Object.values(mappedRow).slice(0, 5));
+          }
+          
+          // Normalize column names (case-insensitive and remove spaces/special chars)
+          // Store all possible variations for flexible matching
+          const normalizedRow = {};
+          Object.keys(mappedRow).forEach(key => {
+            const value = mappedRow[key];
+            // Allow empty strings, only skip undefined and null
+            if (value === undefined || value === null) return;
+            
+            // Convert value to string for consistent handling
+            const stringValue = value.toString();
+            
+            // Store with fully normalized key (no spaces, no special chars, lowercase)
+            const fullyNormalized = normalizeColumnName(key);
+            normalizedRow[fullyNormalized] = stringValue;
+            
+            // Store with spaces removed but lowercase
+            const spaceRemoved = key.toLowerCase().trim().replace(/\s+/g, '');
+            if (spaceRemoved && spaceRemoved !== fullyNormalized) {
+              normalizedRow[spaceRemoved] = stringValue;
+            }
+            
+            // Store original lowercase trimmed version
+            const lowerTrimmed = key.toLowerCase().trim();
+            if (lowerTrimmed && lowerTrimmed !== fullyNormalized && lowerTrimmed !== spaceRemoved) {
+              normalizedRow[lowerTrimmed] = stringValue;
+            }
+            
+            // Also store original key (for exact matches)
+            normalizedRow[key] = stringValue;
+          });
 
-            // Generate default values for required fields (no validation)
-            const trimmedName = name ? name.trim() : `Contact ${rowNumber}`;
-            let trimmedEmail = email ? email.trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
-            const trimmedCompany = company ? company.trim() : 'Unknown Company';
+          // Get values using flexible field matching (pass original row for additional matching)
+          // Handle First Name + Last Name combination for name field
+          // Try to get Name field first
+          const fullName = extractFieldValue(normalizedRow, 'name', ['fullname', 'contactname', 'personname', 'full name', 'contact name', 'person name', 'name'], mappedRow);
+          // Try to get First Name and Last Name separately
+          const firstName = extractFieldValue(normalizedRow, 'firstname', ['firstname', 'first name'], mappedRow);
+          const lastName = extractFieldValue(normalizedRow, 'lastname', ['lastname', 'last name'], mappedRow);
+          
+          let name = '';
+          // Priority: Use full Name if available, otherwise combine First + Last
+          if (fullName && fullName.trim()) {
+            name = fullName.trim();
+          } else if ((firstName && firstName.trim()) || (lastName && lastName.trim())) {
+            const first = firstName && firstName.trim() ? firstName.trim() : '';
+            const last = lastName && lastName.trim() ? lastName.trim() : '';
+            name = [first, last].filter(Boolean).join(' ').trim();
+          }
+          
+          // If still no name, try to find it in any column that might contain a name
+          if (!name || !name.trim()) {
+            // Check mapped row for any field that might be a name
+            for (const [key, value] of Object.entries(mappedRow)) {
+              const keyLower = key.toLowerCase().trim();
+              if ((keyLower.includes('name') || keyLower.includes('contact') || keyLower.includes('person')) && 
+                  value && String(value).trim()) {
+                name = String(value).trim();
+                break;
+              }
+            }
+          }
+          
+          const email = extractFieldValue(normalizedRow, 'email', ['emailaddress', 'email address', 'e-mail', 'mail'], mappedRow);
+          const company = extractFieldValue(normalizedRow, 'company', ['companyname', 'company name', 'organization', 'org', 'firm'], mappedRow);
+          const title = extractFieldValue(normalizedRow, 'title', ['jobtitle', 'job title', 'position', 'designation', '*designation', 'role'], mappedRow);
+          const firstPhone = extractFieldValue(normalizedRow, 'firstPhone', ['firstphone', 'first phone', 'first phone #', 'firstphone#', 'phone', 'phonenumber', 'phone number', 'contactnumber', 'contact number', 'mobilenumber', 'mobile number', 'mobile', 'telephone', 'tel', 'cell', 'cellphone'], mappedRow);
+          const employees = extractFieldValue(normalizedRow, 'employees', ['noofemployees', 'no of employees', 'numberofemployees', 'number of employees', 'employee', 'emp', 'employeecount', 'employee count', 'companysize', 'company size'], mappedRow);
+          const category = extractFieldValue(normalizedRow, 'category', ['cat', 'type'], mappedRow);
+          const industry = extractFieldValue(normalizedRow, 'industry', ['sector', 'businesssector', 'business sector'], mappedRow);
+          const keywords = extractFieldValue(normalizedRow, 'keywords', ['keyword', 'tags', 'tag'], mappedRow);
+          const personLinkedinUrl = extractFieldValue(normalizedRow, 'personLinkedinUrl', [
+            'personlinkedinurl', 'person linkedin url', 'personlinkedin', 'person linkedin', 
+            'person lin', 'personlin', 'linkedinurl', 'linkedin url', 'linkedin', 
+            'linkedinprofile', 'linkedin profile', 'personlinkedinprofile', 'person linkedin profile',
+            'LinkedIn', 'LinkedIn URL', 'LinkedIn Url', 'Person LinkedIn', 'Person LinkedIn URL',
+            'Person LinkedIn Url', 'LinkedIn Profile', 'Person LinkedIn Profile', 'LinkedInProfile',
+            'PersonLinkedIn', 'PersonLinkedInURL', 'PersonLinkedInUrl', 'linkedin', 'LinkedInURL'
+          ], mappedRow);
+          const website = extractFieldValue(normalizedRow, 'website', ['web', 'url', 'websiteurl', 'website url', 'site', 'webaddress', 'web address'], mappedRow);
+          const companyLinkedinUrl = extractFieldValue(normalizedRow, 'companyLinkedinUrl', ['companylinkedinurl', 'company linkedin url', 'companylinkedin', 'company linkedin', 'companylinkedinprofile', 'company linkedin profile'], mappedRow);
+          const facebookUrl = extractFieldValue(normalizedRow, 'facebookUrl', ['facebookurl', 'facebook url', 'facebook', 'fb', 'fburl', 'fb url'], mappedRow);
+          const twitterUrl = extractFieldValue(normalizedRow, 'twitterUrl', ['twitterurl', 'twitter url', 'twitter', 'x'], mappedRow);
+          const city = extractFieldValue(normalizedRow, 'city', ['personcity', 'person city', 'location'], mappedRow);
+          const state = extractFieldValue(normalizedRow, 'state', ['personstate', 'person state', 'province', 'region'], mappedRow);
+          const country = extractFieldValue(normalizedRow, 'country', ['personcountry', 'person country', 'nation'], mappedRow);
+          const companyAddress = extractFieldValue(normalizedRow, 'companyAddress', ['companyaddress', 'company address', 'address', 'companyaddr', 'company addr'], mappedRow);
+          const companyCity = extractFieldValue(normalizedRow, 'companyCity', ['companycity', 'company city'], mappedRow);
+          const companyState = extractFieldValue(normalizedRow, 'companyState', ['companystate', 'company state'], mappedRow);
+          const companyCountry = extractFieldValue(normalizedRow, 'companyCountry', ['companycountry', 'company country'], mappedRow);
+          const companyPhone = extractFieldValue(normalizedRow, 'companyPhone', ['companyphone', 'company phone', 'companyphonenumber', 'company phone number', 'companytel', 'company tel', 'companytelephone', 'company telephone'], mappedRow);
+          const seoDescription = extractFieldValue(normalizedRow, 'seoDescription', ['seodescription', 'seo description', 'seo descr', 'seodescr', 'description', 'about', 'companydescription', 'company description', 'bio'], mappedRow);
+          const technologies = extractFieldValue(normalizedRow, 'technologies', ['tech', 'technology', 'techstack', 'tech stack'], mappedRow);
+          const annualRevenue = extractFieldValue(normalizedRow, 'annualRevenue', ['annualrevenue', 'annual revenue', 'revenue', 'yearlyrevenue', 'yearly revenue'], mappedRow);
 
-            // Create contact object with all fields (accept any data, no validation)
-            contacts.push({
-              name: trimmedName,
-              email: trimmedEmail,
-              company: trimmedCompany,
-              title: title ? title.trim() : '',
-              firstPhone: firstPhone ? firstPhone.trim() : '',
-              employees: employees ? employees.trim() : '',
-              category: category ? category.trim() : '',
-              industry: industry ? industry.trim() : '',
-              keywords: keywords ? keywords.trim() : '',
-              personLinkedinUrl: personLinkedinUrl ? personLinkedinUrl.trim() : '',
-              website: website ? website.trim() : '',
-              companyLinkedinUrl: companyLinkedinUrl ? companyLinkedinUrl.trim() : '',
-              facebookUrl: facebookUrl ? facebookUrl.trim() : '',
-              twitterUrl: twitterUrl ? twitterUrl.trim() : '',
-              city: city ? city.trim() : '',
-              state: state ? state.trim() : '',
-              country: country ? country.trim() : '',
-              companyAddress: companyAddress ? companyAddress.trim() : '',
-              companyCity: companyCity ? companyCity.trim() : '',
-              companyState: companyState ? companyState.trim() : '',
-              companyCountry: companyCountry ? companyCountry.trim() : '',
-              companyPhone: companyPhone ? companyPhone.trim() : '',
-              seoDescription: seoDescription ? seoDescription.trim() : '',
-              technologies: technologies ? technologies.trim() : '',
-              annualRevenue: annualRevenue ? annualRevenue.trim() : ''
-            });
-          })
-          .on('end', resolve)
-          .on('error', reject);
-      });
+          // Check if row has any data at all (from mapped row object)
+          const rowHasData = Object.values(mappedRow).some(val => val !== undefined && val !== null && String(val).trim() !== '');
+          
+          // Skip completely empty rows (check if ALL fields are empty)
+          // But be more lenient - if we have at least name, email, or company, process it
+          const hasAnyData = (name && name.trim()) || (email && email.trim()) || (company && company.trim()) || 
+                           (title && title.trim()) || (firstPhone && firstPhone.trim()) || 
+                           (employees && employees.trim()) || (category && category.trim()) || 
+                           (industry && industry.trim()) || (keywords && keywords.trim()) || 
+                           (personLinkedinUrl && personLinkedinUrl.trim()) || (website && website.trim()) || 
+                           (companyLinkedinUrl && companyLinkedinUrl.trim()) || (facebookUrl && facebookUrl.trim()) || 
+                           (twitterUrl && twitterUrl.trim()) || (city && city.trim()) || (state && state.trim()) || 
+                           (country && country.trim()) || (companyAddress && companyAddress.trim()) || 
+                           (companyCity && companyCity.trim()) || (companyState && companyState.trim()) || 
+                           (companyCountry && companyCountry.trim()) || (companyPhone && companyPhone.trim()) || 
+                           (seoDescription && seoDescription.trim()) || (technologies && technologies.trim()) || 
+                           (annualRevenue && annualRevenue.trim());
+          
+          // If row has data but we couldn't map it, log for debugging
+          if (rowHasData && !hasAnyData) {
+            console.warn(`Row ${rowNumber} has data but couldn't map fields. Keys:`, Object.keys(mappedRow));
+            errors.push(`Row ${rowNumber}: Data present but no mappable fields found`);
+          }
+          
+          if (!hasAnyData) {
+            continue; // Skip empty rows
+          }
+
+          // Validate required fields
+          const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.trim()) ? personLinkedinUrl.trim() : '';
+          if (!trimmedPersonLinkedinUrl) {
+            errors.push(`Row ${rowNumber}: Person Linkedin Url is required`);
+            continue; // Skip this row
+          }
+
+          // Generate default values for required fields
+          // Handle empty strings properly - always create a contact if we have any data
+          // If we have email or company but no name, still create the contact
+          const trimmedName = (name && name.trim()) ? name.trim() : 
+            (email && email.trim()) ? email.split('@')[0] : 
+            (company && company.trim()) ? company.trim() : 
+            `Contact ${rowNumber}`;
+          let trimmedEmail = (email && email.trim()) ? email.trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
+          const trimmedCompany = (company && company.trim()) ? company.trim() : 'Unknown Company';
+
+          // Create contact object with all fields
+          contacts.push({
+            name: trimmedName,
+            email: trimmedEmail,
+            company: trimmedCompany,
+            title: (title && title.trim()) ? title.trim() : '',
+            firstPhone: (firstPhone && firstPhone.trim()) ? firstPhone.trim() : '',
+            employees: (employees && employees.trim()) ? employees.trim() : '',
+            category: (category && category.trim()) ? category.trim() : '',
+            industry: (industry && industry.trim()) ? industry.trim() : '',
+            keywords: (keywords && keywords.trim()) ? keywords.trim() : '',
+            personLinkedinUrl: trimmedPersonLinkedinUrl,
+            website: (website && website.trim()) ? website.trim() : '',
+            companyLinkedinUrl: (companyLinkedinUrl && companyLinkedinUrl.trim()) ? companyLinkedinUrl.trim() : '',
+            facebookUrl: (facebookUrl && facebookUrl.trim()) ? facebookUrl.trim() : '',
+            twitterUrl: (twitterUrl && twitterUrl.trim()) ? twitterUrl.trim() : '',
+            city: (city && city.trim()) ? city.trim() : '',
+            state: (state && state.trim()) ? state.trim() : '',
+            country: (country && country.trim()) ? country.trim() : '',
+            companyAddress: (companyAddress && companyAddress.trim()) ? companyAddress.trim() : '',
+            companyCity: (companyCity && companyCity.trim()) ? companyCity.trim() : '',
+            companyState: (companyState && companyState.trim()) ? companyState.trim() : '',
+            companyCountry: (companyCountry && companyCountry.trim()) ? companyCountry.trim() : '',
+            companyPhone: (companyPhone && companyPhone.trim()) ? companyPhone.trim() : '',
+            seoDescription: (seoDescription && seoDescription.trim()) ? seoDescription.trim() : '',
+            technologies: (technologies && technologies.trim()) ? technologies.trim() : '',
+            annualRevenue: (annualRevenue && annualRevenue.trim()) ? annualRevenue.trim() : ''
+          });
+        } catch (rowError) {
+          console.error(`Error processing CSV row ${i}:`, rowError);
+          errors.push(`Row ${i + 1}: ${rowError.message || 'Error processing row'}`);
+        }
+      }
+      
+      console.log(`CSV parsing completed. Processed ${allLines.length - 1} rows, created ${contacts.length} contacts.`);
     }
 
+    // Log debugging information
+    console.log(`Parsed ${contacts.length} contacts from file`);
+    if (errors.length > 0) {
+      console.log(`Encountered ${errors.length} errors during parsing:`, errors.slice(0, 5));
+    }
+    
     if (contacts.length === 0) {
+      // Provide more helpful error message
+      const errorMessage = errors.length > 0 
+        ? `No contacts found in file. Errors: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '...' : ''}`
+        : 'No contacts found in file. Please ensure the file contains data and has proper column headers (Name, Email, Company, etc.).';
+      
       return res.status(400).json({
         success: false,
-        error: 'No contacts found in file. Please ensure the file contains data.'
+        error: errorMessage,
+        debug: {
+          fileType: isExcel ? 'Excel' : 'CSV',
+          errors: errors.slice(0, 10),
+          totalErrors: errors.length
+        }
       });
     }
 
-    // Handle duplicate emails in the CSV by making them unique
+    // Handle duplicate emails in the file by making them unique
     const emailSet = new Set();
-    let duplicatesInCSV = 0;
+    let duplicatesInFile = 0;
     const uniqueContacts = contacts.map((contact, index) => {
       let email = contact.email;
       let counter = 1;
-      const isDuplicate = emailSet.has(email);
+      const originalEmail = email;
       
-      // If email already exists, make it unique by appending a number
-      while (emailSet.has(email)) {
+      // If email already exists in this batch, make it unique by appending a number
+      while (emailSet.has(email.toLowerCase())) {
         if (counter === 1) {
-          duplicatesInCSV++; // Count the duplicate
+          duplicatesInFile++; // Count the duplicate
         }
-        const baseEmail = contact.email.includes('@') 
-          ? contact.email.split('@')[0] 
-          : `contact${index}`;
-        const domain = contact.email.includes('@') 
-          ? contact.email.split('@')[1] 
+        const baseEmail = originalEmail.includes('@') 
+          ? originalEmail.split('@')[0] 
+          : `contact${index + 1}`;
+        const domain = originalEmail.includes('@') 
+          ? originalEmail.split('@')[1] 
           : 'unknown.com';
         email = `${baseEmail}${counter}@${domain}`;
         counter++;
       }
       
-      emailSet.add(email);
+      emailSet.add(email.toLowerCase());
       return {
         ...contact,
         email: email
       };
     });
 
-    // Check for existing contacts in database (case-insensitive email matching)
+    // Check for existing prospect contacts in database (case-insensitive email matching)
     const emailsToCheck = uniqueContacts.map(c => c.email.toLowerCase());
     
-    // Fetch all contacts and filter case-insensitively
+    // Fetch all prospect contacts and filter case-insensitively
     // Using $in with all possible case variations would be inefficient, so we fetch and filter
     const allPossibleEmails = [...new Set(emailsToCheck)];
-    const existingEmails = await Contact.find({
+    const existingEmails = await ProspectContact.find({
       $or: allPossibleEmails.map(email => ({
         email: { $regex: new RegExp(`^${email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
       }))
@@ -1226,7 +2590,7 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       try {
         // Check for duplicates by email before inserting
         const emailsToInsert = newContacts.map(c => c.email);
-        const existingByEmail = await Contact.find({
+        const existingByEmail = await ProspectContact.find({
           email: { $in: emailsToInsert }
         }).select('_id email').lean();
         
@@ -1235,7 +2599,7 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
         const duplicateEmails = newContacts.filter(c => existingEmailsSet.has(c.email.toLowerCase()));
         
         if (duplicateEmails.length > 0) {
-          console.log(`Skipping ${duplicateEmails.length} contacts that already exist in database`);
+          console.log(`Skipping ${duplicateEmails.length} prospect contacts that already exist in database`);
           // Add existing contacts to existingContacts array
           duplicateEmails.forEach(dupContact => {
             const existing = existingByEmail.find(e => e.email.toLowerCase() === dupContact.email.toLowerCase());
@@ -1249,8 +2613,8 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
         }
         
         if (contactsToInsert.length > 0) {
-          createdContacts = await Contact.insertMany(contactsToInsert, { ordered: false });
-          console.log(`✓ Created ${createdContacts.length} new contacts in Contact collection (databank)`);
+          createdContacts = await ProspectContact.insertMany(contactsToInsert, { ordered: false });
+          console.log(`✓ Created ${createdContacts.length} new prospect contacts in ProspectContact collection`);
         }
       } catch (insertError) {
         // Handle partial inserts (some might succeed)
@@ -1268,7 +2632,7 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               const doc = err.op;
               return doc.email;
             });
-            const existingDups = await Contact.find({
+            const existingDups = await ProspectContact.find({
               email: { $in: duplicateEmails }
             }).select('_id email').lean();
             
@@ -1325,11 +2689,11 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       }
     }
 
-    // Update existing contacts with imported data (fill in missing fields or update with new data)
+    // Update existing prospect contacts with imported data (fill in missing fields or update with new data)
     if (existingContacts.length > 0) {
       const updatePromises = existingContacts.map(async (contact) => {
         try {
-          const existingContact = await Contact.findById(contact.contactId);
+          const existingContact = await ProspectContact.findById(contact.contactId);
           if (existingContact) {
             const updateData = {};
             
@@ -1409,8 +2773,8 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             
             // Update if there are any fields to update
             if (Object.keys(updateData).length > 0) {
-              await Contact.findByIdAndUpdate(contact.contactId, updateData);
-              console.log(`Updated contact ${contact.contactId} with imported data`);
+              await ProspectContact.findByIdAndUpdate(contact.contactId, updateData);
+              console.log(`Updated prospect contact ${contact.contactId} with imported data`);
             }
           }
         } catch (updateError) {
@@ -1465,16 +2829,16 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
 
     // Calculate final imported count (actual ProjectContact documents created)
     const imported = projectContactsCreated;
-    const totalSkipped = skipped + duplicatesInCSV.length;
+    const totalSkipped = skipped + duplicatesInFile;
 
     const newContactsCount = createdContacts.length;
     const existingContactsCount = existingContacts.length;
     
     console.log(`\n=== Bulk Import Summary ===`);
-    console.log(`✓ Contact Collection (Databank): ${newContactsCount} new contacts created, ${existingContactsCount} existing contacts updated`);
+    console.log(`✓ ProspectContact Collection: ${newContactsCount} new prospect contacts created, ${existingContactsCount} existing prospect contacts updated`);
     console.log(`✓ ProjectContact Collection: ${projectContactsCreated} project-contact links created`);
     console.log(`✓ Total imported to project: ${imported} prospects`);
-    console.log(`✓ Skipped: ${totalSkipped} (${duplicatesInCSV.length} duplicates in CSV, ${skipped} already in project)`);
+    console.log(`✓ Skipped: ${totalSkipped} (${duplicatesInFile} duplicates in file, ${skipped} already in project)`);
     console.log(`✓ Errors: ${errors.length}`);
     console.log(`===========================\n`);
 
@@ -1485,13 +2849,13 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
         skipped: totalSkipped,
         errors: errors.length,
         total: contacts.length,
-        duplicatesInCSV: duplicatesInCSV.length,
+        duplicatesInFile: duplicatesInFile,
         alreadyInProject: skipped,
         newContactsInDatabank: newContactsCount,
         existingContactsInDatabank: existingContactsCount,
         projectContactsCreated: projectContactsCreated
       },
-      message: `Successfully imported ${imported} prospects. ${newContactsCount > 0 ? `${newContactsCount} new contacts saved to Contact collection (databank).` : ''} ${existingContactsCount > 0 ? `${existingContactsCount} existing contacts updated in Contact collection.` : ''} ${projectContactsCreated > 0 ? `${projectContactsCreated} ProjectContact links created.` : ''} ${totalSkipped > 0 ? `${totalSkipped} duplicates skipped.` : ''}`
+      message: `Successfully imported ${imported} prospects. ${newContactsCount > 0 ? `${newContactsCount} new prospect contacts saved to ProspectContact collection.` : ''} ${existingContactsCount > 0 ? `${existingContactsCount} existing prospect contacts updated in ProspectContact collection.` : ''} ${projectContactsCreated > 0 ? `${projectContactsCreated} ProjectContact links created.` : ''} ${totalSkipped > 0 ? `${totalSkipped} duplicates skipped.` : ''}`
     });
   } catch (error) {
     console.error('Error importing prospects:', error);
@@ -1507,6 +2871,39 @@ router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, 
   try {
     const { projectId, contactId } = req.params;
     const { stage, assignedTo, priority } = req.body;
+
+    // Validate ObjectIds
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID'
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(contactId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid contact ID'
+      });
+    }
+
+    // Verify project exists
+    const project = await Project.findById(projectId);
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    // Verify prospect contact exists
+    const contact = await ProspectContact.findById(contactId);
+    if (!contact) {
+      return res.status(404).json({
+        success: false,
+        error: 'Prospect contact not found'
+      });
+    }
 
     // Find the project-contact link
     const projectContact = await ProjectContact.findOne({
@@ -1557,10 +2954,27 @@ router.delete('/:projectId/project-contacts', authenticate, async (req, res) => 
     const { projectId } = req.params;
     const { contactIds } = req.body; // Array of contact IDs to remove
 
+    // Validate projectId ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
     if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
       return res.status(400).json({
         success: false,
         error: 'Contact IDs array is required'
+      });
+    }
+
+    // Validate all contact IDs are valid ObjectIds
+    const invalidContactIds = contactIds.filter(id => !mongoose.Types.ObjectId.isValid(id));
+    if (invalidContactIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid contact ID(s): ${invalidContactIds.join(', ')}`
       });
     }
 
