@@ -9,6 +9,7 @@ const Project = require('../models/Project');
 const Contact = require('../models/Contact');
 const ProspectContact = require('../models/ProspectContact');
 const ProjectContact = require('../models/ProjectContact');
+const Activity = require('../models/Activity');
 const authenticate = require('../middleware/auth');
 
 // Get the actual MongoDB collection name for ProspectContact
@@ -177,11 +178,11 @@ router.get('/analytics', authenticate, async (req, res) => {
       Project.countDocuments({ status: 'draft' }),
       Project.countDocuments({ status: 'completed' }),
       
-      // Prospect counts
-      ProjectContact.countDocuments(),
+      // Prospect counts - only from existing projects
+      ProjectContact.countDocuments({ projectId: { $in: projectIds } }),
       
-      // Activity counts
-      Activity.countDocuments(),
+      // Activity counts - only from existing projects
+      Activity.countDocuments({ projectId: { $in: projectIds } }),
       
       // Activities by type
       Activity.aggregate([
@@ -207,8 +208,9 @@ router.get('/analytics', authenticate, async (req, res) => {
         { $sort: { _id: 1 } }
       ]),
       
-      // Stage distribution
+      // Stage distribution - only from existing projects
       ProjectContact.aggregate([
+        { $match: { projectId: { $in: projectIds } } },
         { $group: { _id: '$stage', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
       ]),
@@ -378,8 +380,9 @@ router.get('/analytics', authenticate, async (req, res) => {
         { $limit: 10 }
       ]),
       
-      // Conversion metrics
+      // Conversion metrics - only from existing projects
       ProjectContact.aggregate([
+        { $match: { projectId: { $in: projectIds } } },
         {
           $group: {
             _id: null,
@@ -706,6 +709,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       ]),
       
       // Stage distribution with details
+      // Check both ProspectContact and Contact collections for legacy data
       ProjectContact.aggregate([
         { $match: projectFilter },
         {
@@ -713,10 +717,31 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
             from: PROSPECT_CONTACT_COLLECTION,
             localField: 'contactId',
             foreignField: '_id',
-            as: 'contact'
+            as: 'prospectContact'
           }
         },
-        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: true } },
+        {
+          $lookup: {
+            from: 'contacts', // Legacy Contact collection
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'legacyContact'
+          }
+        },
+        {
+          $project: {
+            stage: 1,
+            priority: 1,
+            // Prefer ProspectContact, fallback to Contact (just for validation)
+            contact: {
+              $cond: {
+                if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                then: { $arrayElemAt: ['$prospectContact', 0] },
+                else: { $arrayElemAt: ['$legacyContact', 0] }
+              }
+            }
+          }
+        },
         {
           $group: {
             _id: '$stage',
@@ -793,6 +818,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       ]),
       
       // Recent activities
+      // Check both ProspectContact and Contact collections for legacy data
       Activity.aggregate([
         { $match: projectFilter },
         {
@@ -800,10 +826,33 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
             from: PROSPECT_CONTACT_COLLECTION,
             localField: 'contactId',
             foreignField: '_id',
-            as: 'contact'
+            as: 'prospectContact'
           }
         },
-        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: true } },
+        {
+          $lookup: {
+            from: 'contacts', // Legacy Contact collection
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'legacyContact'
+          }
+        },
+        {
+          $project: {
+            type: 1,
+            outcome: 1,
+            status: 1,
+            createdAt: 1,
+            // Prefer ProspectContact, fallback to Contact
+            contact: {
+              $cond: {
+                if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                then: { $arrayElemAt: ['$prospectContact', 0] },
+                else: { $arrayElemAt: ['$legacyContact', 0] }
+              }
+            }
+          }
+        },
         { $sort: { createdAt: -1 } },
         { $limit: 10 },
         {
@@ -862,6 +911,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       ]),
       
       // Top performing prospects (by activity count)
+      // Check both ProspectContact and Contact collections for legacy data
       Activity.aggregate([
         { $match: projectFilter },
         {
@@ -869,10 +919,36 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
             from: PROSPECT_CONTACT_COLLECTION,
             localField: 'contactId',
             foreignField: '_id',
-            as: 'contact'
+            as: 'prospectContact'
           }
         },
-        { $unwind: { path: '$contact', preserveNullAndEmptyArrays: true } },
+        {
+          $lookup: {
+            from: 'contacts', // Legacy Contact collection
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'legacyContact'
+          }
+        },
+        {
+          $project: {
+            contactId: 1,
+            createdAt: 1,
+            // Prefer ProspectContact, fallback to Contact
+            contact: {
+              $cond: {
+                if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                then: { $arrayElemAt: ['$prospectContact', 0] },
+                else: { $arrayElemAt: ['$legacyContact', 0] }
+              }
+            }
+          }
+        },
+        {
+          $match: {
+            contact: { $ne: null }
+          }
+        },
         {
           $group: {
             _id: '$contactId',
@@ -1352,7 +1428,9 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
   try {
     const projectId = req.params.id;
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 1000; // Default to 1000, can be increased if needed
+    // Increased limit to 10000 to handle large prospect lists
+    // If no limit is specified, fetch all prospects (set to a high number)
+    const limit = parseInt(req.query.limit) || 10000;
     const skip = (page - 1) * limit;
 
     // Validate ObjectId
@@ -1377,25 +1455,62 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
 
     // Use aggregation pipeline for better performance
     // This avoids the N+1 query problem of populate()
+    // We check both ProspectContact and Contact collections to handle legacy data
     const pipeline = [
       // Match project contacts
       {
         $match: { projectId: projectObjectId }
       },
-      // Lookup prospect contacts
+      // Lookup prospect contacts first (new collection)
       {
         $lookup: {
           from: PROSPECT_CONTACT_COLLECTION, // MongoDB collection name (dynamically retrieved)
           localField: 'contactId',
           foreignField: '_id',
-          as: 'contact'
+          as: 'prospectContact'
         }
       },
-      // Unwind the contact array (should be single contact)
+      // Also lookup in Contact collection (legacy collection)
       {
-        $unwind: {
-          path: '$contact',
-          preserveNullAndEmptyArrays: false // Only include if contact exists
+        $lookup: {
+          from: 'contacts', // Legacy Contact collection
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'legacyContact'
+        }
+      },
+      // Combine both lookups - prefer ProspectContact, fallback to Contact
+      {
+        $project: {
+          contact: {
+            $cond: {
+              if: { $gt: [{ $size: '$prospectContact' }, 0] },
+              then: { $arrayElemAt: ['$prospectContact', 0] },
+              else: { $arrayElemAt: ['$legacyContact', 0] }
+            }
+          },
+          stage: 1,
+          assignedTo: 1,
+          priority: 1,
+          projectContactId: '$_id',
+          createdAt: 1
+        }
+      },
+      // Filter out entries where neither contact was found
+      {
+        $match: {
+          contact: { $ne: null }
+        }
+      },
+      // Filter out default/test prospects (no email AND no phone)
+      // These are typically test/sample data that should not be shown
+      // Keep prospects that have at least email OR phone
+      {
+        $match: {
+          $or: [
+            { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+            { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+          ]
         }
       },
       // Project only needed fields
@@ -1420,7 +1535,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           companyLinkedinUrl: '$contact.companyLinkedinUrl',
           website: '$contact.website',
           employees: '$contact.employees',
-          projectContactId: '$_id',
+          projectContactId: '$projectContactId',
           stage: { $ifNull: ['$stage', 'New'] },
           assignedTo: { $ifNull: ['$assignedTo', ''] },
           priority: { $ifNull: ['$priority', 'Medium'] },
@@ -1434,7 +1549,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       }
     ];
 
-    // Get total count for pagination
+    // Get total count for pagination (checking both collections)
     const countPipeline = [
       { $match: { projectId: projectObjectId } },
       {
@@ -1442,34 +1557,183 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           from: 'prospectcontacts',
           localField: 'contactId',
           foreignField: '_id',
-          as: 'contact'
+          as: 'prospectContact'
         }
       },
       {
-        $unwind: {
-          path: '$contact',
-          preserveNullAndEmptyArrays: false
+        $lookup: {
+          from: 'contacts',
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'legacyContact'
+        }
+      },
+      {
+        $project: {
+          contact: {
+            $cond: {
+              if: { $gt: [{ $size: '$prospectContact' }, 0] },
+              then: { $arrayElemAt: ['$prospectContact', 0] },
+              else: { $arrayElemAt: ['$legacyContact', 0] }
+            }
+          }
+        }
+      },
+      {
+        $match: {
+          contact: { $ne: null },
+          // Filter out default/test prospects (no email AND no phone)
+          $or: [
+            { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+            { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+          ]
         }
       },
       { $count: 'total' }
     ];
 
-    // Execute queries in parallel
+    // Execute queries in parallel to get ProjectContact-based prospects
+    // Note: We don't apply pagination here - we'll do it after combining with activity-based prospects
     const [contactsResult, countResult] = await Promise.all([
       ProjectContact.aggregate([
-        ...pipeline,
-        { $skip: skip },
-        { $limit: limit }
+        ...pipeline
+        // Pagination removed - will be applied after combining results
       ]),
       ProjectContact.aggregate(countPipeline)
     ]);
 
-    const total = countResult[0]?.total || 0;
+    // Also get prospects that have activities for this project but no ProjectContact entry
+    const activitiesWithContacts = await Activity.aggregate([
+      {
+        $match: {
+          projectId: projectObjectId,
+          contactId: { $ne: null, $exists: true }
+        }
+      },
+      {
+        $group: {
+          _id: '$contactId'
+        }
+      }
+    ]);
+
+    const activityContactIds = activitiesWithContacts.map(a => a._id).filter(id => id != null);
+    
+    // Get contactIds that already have ProjectContact entries
+    const existingProjectContacts = await ProjectContact.find(
+      { projectId: projectObjectId },
+      { contactId: 1 }
+    ).lean();
+    const existingContactIds = new Set(
+      existingProjectContacts
+        .map(pc => pc.contactId)
+        .filter(id => id != null)
+        .map(id => id.toString())
+    );
+
+    // Find contactIds with activities but no ProjectContact entry
+    const missingContactIds = activityContactIds.filter(
+      contactId => {
+        if (!contactId) return false;
+        const contactIdStr = contactId.toString();
+        return !existingContactIds.has(contactIdStr);
+      }
+    );
+
+    // Fetch prospects that have activities but no ProjectContact entry
+    // Check both ProspectContact and Contact collections
+    let additionalProspects = [];
+    if (missingContactIds.length > 0) {
+      const missingObjectIds = missingContactIds.map(id => new mongoose.Types.ObjectId(id));
+      
+      // Try to find in ProspectContact first
+      const prospectContacts = await ProspectContact.find(
+        { _id: { $in: missingObjectIds } }
+      ).lean();
+      
+      // Find which IDs were found in ProspectContact
+      const foundInProspectContact = new Set(
+        prospectContacts.map(pc => pc._id.toString())
+      );
+      
+      // Find remaining IDs that weren't in ProspectContact, check Contact collection
+      const remainingIds = missingObjectIds.filter(
+        id => !foundInProspectContact.has(id.toString())
+      );
+      
+      let legacyContacts = [];
+      if (remainingIds.length > 0) {
+        legacyContacts = await Contact.find(
+          { _id: { $in: remainingIds } }
+        ).lean();
+      }
+      
+      // Combine both results
+      const allAdditionalContacts = [...prospectContacts, ...legacyContacts];
+      
+      // Format additional prospects to match the structure of contactsResult
+      additionalProspects = allAdditionalContacts.map(contact => ({
+        _id: contact._id,
+        name: contact.name,
+        title: contact.title,
+        company: contact.company,
+        email: contact.email,
+        firstPhone: contact.firstPhone,
+        category: contact.category,
+        industry: contact.industry,
+        keywords: contact.keywords,
+        city: contact.city,
+        state: contact.state,
+        country: contact.country,
+        companyCity: contact.companyCity,
+        companyState: contact.companyState,
+        companyCountry: contact.companyCountry,
+        personLinkedinUrl: contact.personLinkedinUrl,
+        companyLinkedinUrl: contact.companyLinkedinUrl,
+        website: contact.website,
+        employees: contact.employees,
+        projectContactId: null, // No ProjectContact entry
+        stage: 'New', // Default stage
+        assignedTo: '', // Default assignedTo
+        priority: 'Medium', // Default priority
+        isImported: false,
+        matchType: 'activity'
+      }));
+    }
+
+    // Combine results and remove duplicates (in case a prospect appears in both)
+    const allContactsMap = new Map();
+    
+    // Add ProjectContact-based prospects
+    contactsResult.forEach(contact => {
+      allContactsMap.set(contact._id.toString(), contact);
+    });
+    
+    // Add activity-based prospects (only if not already present)
+    additionalProspects.forEach(contact => {
+      if (!allContactsMap.has(contact._id.toString())) {
+        allContactsMap.set(contact._id.toString(), contact);
+      }
+    });
+
+    // Convert map to array and sort
+    const allContacts = Array.from(allContactsMap.values()).sort((a, b) => {
+      // Sort by _id descending (newest first)
+      // Handle both ObjectId and string _id
+      const aId = a._id instanceof mongoose.Types.ObjectId ? a._id : new mongoose.Types.ObjectId(a._id);
+      const bId = b._id instanceof mongoose.Types.ObjectId ? b._id : new mongoose.Types.ObjectId(b._id);
+      return bId.getTimestamp() - aId.getTimestamp();
+    });
+
+    // Apply pagination to combined results
+    const paginatedContacts = allContacts.slice(skip, skip + limit);
+    // Total includes both ProjectContact entries and activity-based prospects
+    const total = allContacts.length;
     const totalPages = Math.ceil(total / limit);
 
     res.json({
       success: true,
-      data: contactsResult,
+      data: paginatedContacts,
       pagination: {
         page,
         limit,

@@ -3,6 +3,7 @@ const router = express.Router();
 const mongoose = require('mongoose');
 const Activity = require('../models/Activity');
 const ProspectContact = require('../models/ProspectContact');
+const Contact = require('../models/Contact');
 const authenticate = require('../middleware/auth');
 
 // Mongoose automatically pluralizes and lowercases: 'ProspectContact' -> 'prospectcontacts'
@@ -151,16 +152,20 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
   try {
     const contactObjectId = new mongoose.Types.ObjectId(req.params.contactId);
     
-    // First verify the contact exists in ProspectContact
-    const contact = await ProspectContact.findById(contactObjectId).lean();
-    if (!contact) {
+    // First verify the contact exists in either ProspectContact or Contact (legacy)
+    const [prospectContact, legacyContact] = await Promise.all([
+      ProspectContact.findById(contactObjectId).lean(),
+      Contact.findById(contactObjectId).lean()
+    ]);
+    
+    if (!prospectContact && !legacyContact) {
       return res.status(404).json({
         success: false,
-        error: 'Contact not found in ProspectContact'
+        error: 'Contact not found'
       });
     }
     
-    // Use aggregation for better performance - lookup from ProspectContact collection
+    // Use aggregation for better performance - lookup from both ProspectContact and Contact collections
     const activities = await Activity.aggregate([
       { $match: { contactId: contactObjectId } },
       {
@@ -182,13 +187,15 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
           from: PROSPECT_CONTACT_COLLECTION,
           localField: 'contactId',
           foreignField: '_id',
-          as: 'contact'
+          as: 'prospectContact'
         }
       },
       {
-        $unwind: {
-          path: '$contact',
-          preserveNullAndEmptyArrays: true
+        $lookup: {
+          from: 'contacts',
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'legacyContact'
         }
       },
       {
@@ -199,10 +206,21 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
           },
           contactId: 1,
           contact: {
-            _id: '$contact._id',
-            name: '$contact.name',
-            email: '$contact.email',
-            company: '$contact.company'
+            $cond: {
+              if: { $gt: [{ $size: '$prospectContact' }, 0] },
+              then: {
+                _id: { $arrayElemAt: ['$prospectContact._id', 0] },
+                name: { $arrayElemAt: ['$prospectContact.name', 0] },
+                email: { $arrayElemAt: ['$prospectContact.email', 0] },
+                company: { $arrayElemAt: ['$prospectContact.company', 0] }
+              },
+              else: {
+                _id: { $arrayElemAt: ['$legacyContact._id', 0] },
+                name: { $arrayElemAt: ['$legacyContact.name', 0] },
+                email: { $arrayElemAt: ['$legacyContact.email', 0] },
+                company: { $arrayElemAt: ['$legacyContact.company', 0] }
+              }
+            }
           },
           type: 1,
           template: 1,
