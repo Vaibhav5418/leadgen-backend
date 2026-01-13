@@ -1101,6 +1101,25 @@ router.get('/', authenticate, async (req, res) => {
         }
       },
       {
+        $lookup: {
+          from: 'projectcontacts',
+          let: { projectId: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $eq: ['$projectId', '$$projectId']
+                }
+              }
+            },
+            {
+              $count: 'count'
+            }
+          ],
+          as: 'prospectCountArray'
+        }
+      },
+      {
         $project: {
           companyName: 1,
           website: 1,
@@ -1118,6 +1137,16 @@ router.get('/', authenticate, async (req, res) => {
           status: 1,
           createdAt: 1,
           updatedAt: 1,
+          totalProspects: {
+            $let: {
+              vars: {
+                countDoc: { $arrayElemAt: ['$prospectCountArray', 0] }
+              },
+              in: {
+                $ifNull: ['$$countDoc.count', 0]
+              }
+            }
+          },
           createdBy: {
             $cond: {
               if: { $ne: ['$createdByUser', null] },

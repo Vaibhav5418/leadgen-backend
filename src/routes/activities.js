@@ -42,14 +42,7 @@ router.post('/', authenticate, async (req, res) => {
       });
     }
 
-    // Status is required for Email and LinkedIn activities
-    if ((type === 'email' || type === 'linkedin') && !status) {
-      return res.status(400).json({
-        success: false,
-        error: 'Status is required for email and LinkedIn activities'
-      });
-    }
-
+    // Status is now optional for all activity types (Email, LinkedIn, and Call)
     // Conversation Notes is now optional - no minimum length validation
 
     // Next action and date are now optional
