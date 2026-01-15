@@ -3714,13 +3714,12 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       });
     }
 
-    // ALLOW DUPLICATES: Process all contacts as new contacts, even if they have duplicate emails
-    // This allows the same contact to be imported multiple times
+    // Check for duplicates ONLY in ProspectContact collection (NOT Contact collection)
     const contactsToImport = contacts.map((contact) => {
       // Ensure email is properly formatted (if it exists)
       if (contact.email && contact.email.trim() && contact.email.includes('@')) {
-      return {
-        ...contact,
+        return {
+          ...contact,
           email: contact.email.trim().toLowerCase()
         };
       } else {
@@ -3732,18 +3731,67 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       }
     });
 
-    // ALL contacts will be treated as new contacts (allow duplicates)
-    const newContacts = contactsToImport;
-    const existingContacts = []; // No existing contacts - all are new
+    // Check for duplicates in ProspectContact collection only
+    const newContacts = [];
+    const existingContacts = [];
+    const duplicateEmails = new Set();
+    const duplicateNameCompany = new Set();
 
-    // Create new contacts in database
+    for (const contact of contactsToImport) {
+      let isDuplicate = false;
+      let duplicateReason = '';
+
+      // Normalize values for comparison
+      const normalizedEmail = contact.email ? contact.email.trim().toLowerCase() : '';
+      const normalizedName = contact.name ? contact.name.trim().toLowerCase() : '';
+      const normalizedCompany = contact.company ? contact.company.trim().toLowerCase() : '';
+
+      // Primary check: Email (if available)
+      if (normalizedEmail) {
+        const existingByEmail = await ProspectContact.findOne({
+          email: { $regex: new RegExp(`^${normalizedEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+        });
+        
+        if (existingByEmail) {
+          isDuplicate = true;
+          duplicateReason = `Email "${contact.email}" already exists in ProspectContact collection`;
+          duplicateEmails.add(normalizedEmail);
+        }
+      }
+
+      // Secondary check: Name + Company combination (if email not found and both name and company exist)
+      if (!isDuplicate && normalizedName && normalizedCompany) {
+        const existingByNameCompany = await ProspectContact.findOne({
+          name: { $regex: new RegExp(`^${normalizedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
+          company: { $regex: new RegExp(`^${normalizedCompany.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+        });
+        
+        if (existingByNameCompany) {
+          isDuplicate = true;
+          duplicateReason = `Name "${contact.name}" and company "${contact.company}" combination already exists in ProspectContact collection`;
+          duplicateNameCompany.add(`${normalizedName}|${normalizedCompany}`);
+        }
+      }
+
+      if (isDuplicate) {
+        existingContacts.push({
+          ...contact,
+          duplicateReason
+        });
+      } else {
+        newContacts.push(contact);
+      }
+    }
+
+    console.log(`Duplicate check completed: ${newContacts.length} new contacts, ${existingContacts.length} duplicates found in ProspectContact collection`);
+
+    // Create new contacts in database (only non-duplicates)
     let createdContacts = [];
     if (newContacts.length > 0) {
       try {
-        // Insert ALL contacts (duplicates allowed)
-        // No duplicate checking - all contacts from file are inserted as new
+        // Insert only new contacts (duplicates already filtered out)
         createdContacts = await ProspectContact.insertMany(newContacts, { ordered: false });
-        console.log(`✓ Created ${createdContacts.length} prospect contacts in ProspectContact collection (duplicates allowed)`);
+        console.log(`✓ Created ${createdContacts.length} new prospect contacts in ProspectContact collection`);
       } catch (insertError) {
         // Handle partial inserts (some might succeed)
         if (insertError.writeErrors) {
@@ -3752,25 +3800,51 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
           const insertedIds = insertError.insertedIds || {};
           createdContacts = Object.values(insertedIds).map(id => ({ _id: id }));
           
-          // Log errors but continue - duplicates are allowed
-          // Note: If there are unique index constraints on email, some inserts may fail
-          // But we allow duplicates, so we'll continue with successfully inserted contacts
-          console.log(`Note: Some contacts had insertion errors, but duplicates are allowed`);
+          // Log errors but continue - some inserts may have failed due to unique constraints
+          console.log(`Note: Some contacts had insertion errors, continuing with successfully inserted contacts`);
         } else {
           throw insertError;
         }
       }
     }
 
-    // Link all contacts to the project (allow duplicates - create ProjectContact for all imported contacts)
-    const projectContacts = [];
-    let skipped = 0;
+    // Handle existing contacts (duplicates found in ProspectContact)
+    // Get the existing contact IDs from ProspectContact collection
+    const existingContactIds = [];
+    for (const existingContact of existingContacts) {
+      const normalizedEmail = existingContact.email ? existingContact.email.trim().toLowerCase() : '';
+      const normalizedName = existingContact.name ? existingContact.name.trim().toLowerCase() : '';
+      const normalizedCompany = existingContact.company ? existingContact.company.trim().toLowerCase() : '';
 
-    // Get all contact IDs that were just created
-    const allContactIds = createdContacts.map(c => c._id).filter(id => id);
+      let foundContact = null;
+      
+      // Find by email first
+      if (normalizedEmail) {
+        foundContact = await ProspectContact.findOne({
+          email: { $regex: new RegExp(`^${normalizedEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+        });
+      }
+      
+      // If not found by email, try name + company
+      if (!foundContact && normalizedName && normalizedCompany) {
+        foundContact = await ProspectContact.findOne({
+          name: { $regex: new RegExp(`^${normalizedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
+          company: { $regex: new RegExp(`^${normalizedCompany.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+        });
+      }
+      
+      if (foundContact) {
+        existingContactIds.push(foundContact._id);
+      }
+    }
+
+    // Combine new and existing contact IDs
+    const allContactIds = [
+      ...createdContacts.map(c => c._id).filter(id => id),
+      ...existingContactIds
+    ];
 
     // Check for existing project-contact links to avoid duplicate ProjectContact entries
-    // But still allow duplicate ProspectContact entries
     const existingProjectContacts = await ProjectContact.find({
       projectId: project._id,
       contactId: { $in: allContactIds }
@@ -3780,15 +3854,31 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       existingProjectContacts.map(pc => pc.contactId.toString())
     );
 
-    // Create project-contact links for ALL imported contacts
-    // Even if they have duplicate emails, each gets its own ProjectContact entry
+    // Create project-contact links for ALL contacts (both new and existing)
+    const projectContacts = [];
+    let skipped = 0;
+
+    // Link new contacts
     for (const contact of createdContacts) {
-      // Check if this specific contact ID already has a ProjectContact entry
-      // This prevents duplicate ProjectContact entries for the same contact ID
       if (!existingProjectContactSet.has(contact._id.toString())) {
         projectContacts.push({
           projectId: project._id,
           contactId: contact._id,
+          stage: defaultStage || 'New',
+          assignedTo: assignTo || project.assignedTo || '',
+          createdBy: req.user._id
+        });
+      } else {
+        skipped++;
+      }
+    }
+
+    // Link existing contacts (duplicates from ProspectContact)
+    for (const contactId of existingContactIds) {
+      if (!existingProjectContactSet.has(contactId.toString())) {
+        projectContacts.push({
+          projectId: project._id,
+          contactId: contactId,
           stage: defaultStage || 'New',
           assignedTo: assignTo || project.assignedTo || '',
           createdBy: req.user._id
@@ -3830,10 +3920,11 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
     const totalSkipped = skipped;
 
     const newContactsCount = createdContacts.length;
-    const existingContactsCount = 0; // No existing contacts - all are new (duplicates allowed)
+    const existingContactsCount = existingContacts.length;
     
     console.log(`\n=== Bulk Import Summary ===`);
-    console.log(`✓ ProspectContact Collection: ${newContactsCount} prospect contacts created (duplicates allowed)`);
+    console.log(`✓ ProspectContact Collection: ${newContactsCount} new prospect contacts created`);
+    console.log(`✓ Duplicates found in ProspectContact: ${existingContactsCount} (not created, but linked to project)`);
     console.log(`✓ ProjectContact Collection: ${projectContactsCreated} project-contact links created`);
     console.log(`✓ Total imported to project: ${imported} prospects`);
     console.log(`✓ Skipped: ${totalSkipped} (already linked to this project)`);
@@ -3853,7 +3944,7 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
         existingContactsInDatabank: existingContactsCount,
         projectContactsCreated: projectContactsCreated
       },
-      message: `Successfully imported ${imported} prospects. ${newContactsCount > 0 ? `${newContactsCount} prospect contacts saved to ProspectContact collection (duplicates allowed).` : ''} ${projectContactsCreated > 0 ? `${projectContactsCreated} ProjectContact links created.` : ''} ${totalSkipped > 0 ? `${totalSkipped} already linked to this project.` : ''}`
+      message: `Successfully imported ${imported} prospects. ${newContactsCount > 0 ? `${newContactsCount} new prospect contacts created in ProspectContact collection.` : ''} ${existingContactsCount > 0 ? `${existingContactsCount} duplicates found in ProspectContact (linked to project).` : ''} ${projectContactsCreated > 0 ? `${projectContactsCreated} ProjectContact links created.` : ''} ${totalSkipped > 0 ? `${totalSkipped} already linked to this project.` : ''}`
     });
   } catch (error) {
     console.error('Error importing prospects:', error);
