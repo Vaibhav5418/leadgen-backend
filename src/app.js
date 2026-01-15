@@ -92,6 +92,7 @@ app.use('/api/contacts', require('./routes/contacts'));
 app.use('/api/import', require('./routes/import'));
 app.use('/api/linkedin', require('./routes/linkedin'));
 app.use('/api/dashboard', require('./routes/dashboard'));
+app.use('/api/master-dashboard', require('./routes/master-dashboard'));
 app.use('/api/company-analysis', require('./routes/company-analysis'));
 app.use('/api/categories', require('./routes/categories'));
 app.use('/api/projects', require('./routes/projects'));

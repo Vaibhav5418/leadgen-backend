@@ -1013,25 +1013,91 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       ])
     ]);
     
-    // Calculate Cold Calling Funnel
+    // Calculate Cold Calling Funnel - Updated 10-stage structure
+    const callsAttemptedSet = new Set();
+    const callsConnectedSet = new Set();
+    const decisionMakerReachedSet = new Set();
+    const interestedSet = new Set();
+    const detailsSharedSet = new Set();
+    const demoBookedSet = new Set();
+    const demoCompletedSet = new Set();
+    const sqlSet = new Set();
+    const wonSet = new Set();
+
+    callFunnel.forEach(c => {
+      const contactId = c._id?.toString();
+      if (!contactId) return;
+
+      // Calls Attempted
+      if (c.callDate) {
+        callsAttemptedSet.add(contactId);
+      }
+
+      // Calls Connected - if callStatus indicates a connection
+      const connectedStatuses = ['Interested', 'Not Interested', 'Call Back', 'Future', 'Details Shared', 'Demo Booked', 'Demo Completed', 'Existing'];
+      if (c.callStatus && connectedStatuses.includes(c.callStatus)) {
+        callsConnectedSet.add(contactId);
+      }
+
+      // Decision Maker Reached
+      const decisionMakerStatuses = ['Interested', 'Details Shared', 'Demo Booked', 'Demo Completed'];
+      if (c.callStatus && decisionMakerStatuses.includes(c.callStatus)) {
+        decisionMakerReachedSet.add(contactId);
+      }
+
+      // Interested
+      if (c.callStatus === 'Interested') {
+        interestedSet.add(contactId);
+      }
+
+      // Details Shared
+      if (c.callStatus === 'Details Shared') {
+        detailsSharedSet.add(contactId);
+      }
+
+      // Demo Booked
+      if (c.callStatus === 'Demo Booked') {
+        demoBookedSet.add(contactId);
+      }
+
+      // Demo Completed
+      if (c.callStatus === 'Demo Completed') {
+        demoCompletedSet.add(contactId);
+      }
+
+      // SQL
+      if (c.callStatus === 'Demo Completed' || 
+          (c.callStatus === 'Interested' && c.conversationNotes && c.conversationNotes.length > 50)) {
+        sqlSet.add(contactId);
+      }
+    });
+
+    // Get WON from ProjectContact stage
+    const wonCount = await ProjectContact.countDocuments({
+      ...projectFilter,
+      stage: 'WON'
+    });
+
     const callFunnelData = {
       prospectData: totalProspects,
-      callSent: callFunnel.filter(c => c.callDate).length,
-      accepted: callFunnel.filter(c => ['Interested', 'Details Shared', 'Demo Booked'].includes(c.callStatus)).length,
-      followups: callFunnel.filter(c => {
-        const callNum = c.callNumber;
-        return callNum && (callNum.includes('2nd') || callNum.includes('3rd') || callNum.includes('4th') || callNum.includes('5th') || callNum.includes('6th') || callNum.includes('7th') || callNum.includes('8th') || callNum.includes('9th') || callNum.includes('10th'));
-      }).length,
-      cip: callFunnel.filter(c => ['Interested', 'Call Back', 'Future'].includes(c.callStatus)).length,
-      meetingProposed: callFunnel.filter(c => c.nextAction && (
-        c.nextAction.toLowerCase().includes('meeting') ||
-        c.nextAction.toLowerCase().includes('demo') ||
-        c.nextAction.toLowerCase().includes('call')
-      )).length,
-      scheduled: callFunnel.filter(c => c.callStatus === 'Demo Booked' || c.nextActionDate).length,
-      completed: callFunnel.filter(c => c.callStatus === 'Demo Completed').length,
-      sql: callFunnel.filter(c => c.callStatus === 'Demo Completed' || 
-        (c.callStatus === 'Interested' && c.conversationNotes && c.conversationNotes.length > 50)).length
+      // New 10-stage structure
+      callsAttempted: callsAttemptedSet.size,
+      callsConnected: callsConnectedSet.size,
+      decisionMakerReached: decisionMakerReachedSet.size,
+      interested: interestedSet.size,
+      detailsShared: detailsSharedSet.size,
+      demoBooked: demoBookedSet.size,
+      demoCompleted: demoCompletedSet.size,
+      sql: sqlSet.size,
+      won: wonCount,
+      // Legacy fields for backward compatibility
+      callSent: callsAttemptedSet.size,
+      accepted: callsConnectedSet.size,
+      followups: 0, // Removed in new structure
+      cip: 0, // Removed in new structure
+      meetingProposed: 0, // Removed in new structure
+      scheduled: demoBookedSet.size,
+      completed: demoCompletedSet.size
     };
     
     // Calculate Email Funnel
@@ -1525,7 +1591,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
 
     // Use aggregation for better performance with large datasets
     const projectObjectId = new mongoose.Types.ObjectId(projectId);
-    
+
     // Check if project exists (lightweight check)
     const projectExists = await Project.exists({ _id: projectObjectId });
     if (!projectExists) {
@@ -2346,6 +2412,71 @@ router.put('/:id', authenticate, async (req, res) => {
   }
 });
 
+// Delete project contacts (bulk remove prospects from project)
+// IMPORTANT: This route must come BEFORE the generic /:id route to avoid route matching conflicts
+router.delete('/:projectId/project-contacts', authenticate, async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const { contactIds } = req.body; // Array of contact IDs to remove
+
+    // Validate projectId ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
+    if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Contact IDs array is required'
+      });
+    }
+
+    // Validate all contact IDs are valid ObjectIds
+    const invalidContactIds = contactIds.filter(id => !mongoose.Types.ObjectId.isValid(id));
+    if (invalidContactIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid contact ID(s): ${invalidContactIds.join(', ')}`
+      });
+    }
+
+    // Verify project exists
+    const project = await Project.findOne({ _id: projectId });
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    // Convert contact IDs to ObjectIds
+    const contactObjectIds = contactIds.map(id => new mongoose.Types.ObjectId(id));
+
+    // Delete project-contact links
+    const result = await ProjectContact.deleteMany({
+      projectId: projectId,
+      contactId: { $in: contactObjectIds }
+    });
+
+    res.json({
+      success: true,
+      message: `Successfully removed ${result.deletedCount} prospect(s) from project`,
+      data: {
+        deletedCount: result.deletedCount
+      }
+    });
+  } catch (error) {
+    console.error('Error removing prospects from project:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to remove prospects from project'
+    });
+  }
+});
+
 // Delete a project
 router.delete('/:id', authenticate, async (req, res) => {
   try {
@@ -2810,17 +2941,83 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
           cellDates: false,
           cellNF: false,
           cellText: false,
-          raw: false,
+          raw: true, // Keep raw values to preserve data types
           codepage: 65001 // UTF-8
         });
         const sheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[sheetName];
+        
+        // Read Excel data - use default header behavior (first row as headers, returns objects)
+        // This ensures all data is read correctly and headers are properly detected
         const rows = XLSX.utils.sheet_to_json(worksheet, {
-          defval: '', // Default value for empty cells
-          raw: false // Convert all values to strings
+          defval: null, // Use null for empty cells (we'll convert to empty string)
+          raw: false, // Convert all values to formatted strings
+          blankrows: true // Include all rows, even blank ones
         });
         
-        rows.forEach((row, index) => {
+        // Process rows to ensure all data is preserved and properly formatted
+        const processedRows = rows.map((row) => {
+          const processedRow = {};
+          // Process each key-value pair to preserve all data
+          Object.keys(row).forEach(key => {
+            const value = row[key];
+            // Convert null/undefined to empty string, but preserve all other values
+            if (value === null || value === undefined) {
+              processedRow[key] = '';
+            } else {
+              // Convert to string and preserve the actual value
+              processedRow[key] = String(value);
+            }
+          });
+          return processedRow;
+        });
+        
+        // Fix concatenated headers (e.g., "Full NameFirst NameLast Name" -> split into separate fields)
+        // This handles cases where Excel headers are merged or concatenated
+        const fixedRows = processedRows.map((row) => {
+          const fixedRow = {};
+          Object.keys(row).forEach(key => {
+            const value = row[key];
+            // Check if header might be concatenated (contains multiple field names)
+            // Try to split common concatenated patterns
+            if (key.toLowerCase().includes('fullname') && key.toLowerCase().includes('firstname') && key.toLowerCase().includes('lastname')) {
+              // This is "Full NameFirst NameLast Name" - try to extract full name
+              // For now, store under multiple keys
+              fixedRow[key] = value; // Keep original
+              fixedRow['Full Name'] = value; // Also store as "Full Name"
+              fixedRow['fullname'] = value; // Normalized version
+            } else if (key.toLowerCase().includes('designati')) {
+              // Handle "*designati" or "*designation"
+              fixedRow[key] = value;
+              fixedRow['*designation'] = value;
+              fixedRow['designation'] = value;
+              fixedRow['title'] = value; // Also map to title
+            } else if (key.toLowerCase().includes('employeeon') || key.toLowerCase().includes('employeelinkedin')) {
+              // Handle "Employeeon" or "Employees on LinkedIn"
+              fixedRow[key] = value;
+              fixedRow['employees'] = value;
+              fixedRow['Employees on LinkedIn'] = value;
+            } else {
+              fixedRow[key] = value;
+            }
+          });
+          return fixedRow;
+        });
+        
+        // Log for debugging - show what was read
+        if (fixedRows.length > 0) {
+          console.log(`Excel file parsed: ${fixedRows.length} rows found`);
+          console.log(`First row column names:`, Object.keys(fixedRows[0]));
+          console.log(`All column names:`, Object.keys(fixedRows[0]));
+          if (fixedRows.length > 1) {
+            console.log(`Sample data from row 2:`, Object.keys(fixedRows[1]).slice(0, 10).reduce((acc, key) => {
+              acc[key] = fixedRows[1][key];
+              return acc;
+            }, {}));
+          }
+        }
+        
+        fixedRows.forEach((row, index) => {
           try {
             const rowNumber = index + 1;
             
@@ -2853,21 +3050,82 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               
               // Also store original key (for exact matches)
               normalizedRow[key] = stringValue;
+              
+              // Handle concatenated headers (e.g., "Full NameFirst NameLast Name")
+              // Try to extract individual field names from concatenated headers
+              const keyLower = key.toLowerCase();
+              
+              // IMPORTANT: Check for separate First Name and Last Name columns FIRST
+              // This ensures we don't override them with concatenated header logic
+              if (keyLower === 'first name' || keyLower === 'firstname' || 
+                  (keyLower.includes('first') && keyLower.includes('name') && !keyLower.includes('full') && !keyLower.includes('last'))) {
+                // This is a separate First Name column
+                normalizedRow['firstname'] = stringValue;
+                normalizedRow['first name'] = stringValue;
+                // Don't set as fullname - keep it separate
+              }
+              
+              if (keyLower === 'last name' || keyLower === 'lastname' || 
+                  (keyLower.includes('last') && keyLower.includes('name') && !keyLower.includes('full') && !keyLower.includes('first'))) {
+                // This is a separate Last Name column
+                normalizedRow['lastname'] = stringValue;
+                normalizedRow['last name'] = stringValue;
+                // Don't set as fullname - keep it separate
+              }
+              
+              // Check for concatenated "Full NameFirst NameLast Name" pattern
+              // Only treat as concatenated if it contains ALL three terms
+              if ((keyLower.includes('fullname') || keyLower.includes('full name')) && 
+                  (keyLower.includes('firstname') || keyLower.includes('first name')) && 
+                  (keyLower.includes('lastname') || keyLower.includes('last name'))) {
+                // This is a concatenated header - the value should be the full name
+                normalizedRow['fullname'] = stringValue;
+                normalizedRow['name'] = stringValue;
+                normalizedRow['full name'] = stringValue;
+              } else if ((keyLower.includes('fullname') || keyLower.includes('full name')) && 
+                         !keyLower.includes('first') && !keyLower.includes('last')) {
+                // This is just "Full Name" without concatenation
+                normalizedRow['fullname'] = stringValue;
+                normalizedRow['name'] = stringValue;
+              }
+              if (keyLower.includes('designati') || keyLower.includes('designation')) {
+                normalizedRow['designation'] = stringValue;
+                normalizedRow['title'] = stringValue;
+                normalizedRow['*designation'] = stringValue;
+              }
+              if ((keyLower.includes('employee') || keyLower.includes('emp')) && !keyLower.includes('phone')) {
+                normalizedRow['employees'] = stringValue;
+              }
             });
 
             // Get values using flexible field matching (pass original row for additional matching)
-            // Handle First Name + Last Name combination for name field
-            // Try to get Name field first
-            const fullName = extractFieldValue(normalizedRow, 'name', ['fullname', 'contactname', 'personname', 'full name', 'contact name', 'person name', 'name'], row);
-            // Try to get First Name and Last Name separately
+            // IMPORTANT: Extract First Name and Last Name FIRST before checking for Full Name
+            // This ensures we get separate First/Last names when they exist as separate columns
             const firstName = extractFieldValue(normalizedRow, 'firstname', ['firstname', 'first name'], row);
             const lastName = extractFieldValue(normalizedRow, 'lastname', ['lastname', 'last name'], row);
             
+            // Try to get Full Name field
+            const fullName = extractFieldValue(normalizedRow, 'name', ['fullname', 'contactname', 'personname', 'full name', 'contact name', 'person name', 'name'], row);
+            
             let name = '';
-            // Priority: Use full Name if available, otherwise combine First + Last
-            if (fullName && fullName.trim()) {
+            // Priority logic:
+            // 1. If we have both First Name and Last Name as separate columns, combine them
+            // 2. Otherwise, use Full Name if available
+            // 3. Otherwise, use First Name or Last Name alone if available
+            if (firstName && firstName.trim() && lastName && lastName.trim()) {
+              // We have both First and Last Name - combine them
+              name = `${firstName.trim()} ${lastName.trim()}`.trim();
+            } else if (firstName && firstName.trim()) {
+              // Only First Name available
+              name = firstName.trim();
+            } else if (lastName && lastName.trim()) {
+              // Only Last Name available
+              name = lastName.trim();
+            } else if (fullName && fullName.trim()) {
+              // Use Full Name if available
               name = fullName.trim();
             } else if ((firstName && firstName.trim()) || (lastName && lastName.trim())) {
+              // Fallback: combine whatever we have
               const first = firstName && firstName.trim() ? firstName.trim() : '';
               const last = lastName && lastName.trim() ? lastName.trim() : '';
               name = [first, last].filter(Boolean).join(' ').trim();
@@ -2894,7 +3152,8 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             const category = extractFieldValue(normalizedRow, 'category', ['cat', 'type'], row);
             const industry = extractFieldValue(normalizedRow, 'industry', ['sector', 'businesssector', 'business sector'], row);
             const keywords = extractFieldValue(normalizedRow, 'keywords', ['keyword', 'tags', 'tag'], row);
-            const personLinkedinUrl = extractFieldValue(normalizedRow, 'personLinkedinUrl', [
+            // Try to find LinkedIn URL - be very flexible since it might be in any column
+            let personLinkedinUrl = extractFieldValue(normalizedRow, 'personLinkedinUrl', [
               'personlinkedinurl', 'person linkedin url', 'personlinkedin', 'person linkedin', 
               'person lin', 'personlin', 'linkedinurl', 'linkedin url', 'linkedin', 
               'linkedinprofile', 'linkedin profile', 'personlinkedinprofile', 'person linkedin profile',
@@ -2904,6 +3163,34 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               'person linkedinurl', 'personlinkedin url', 'linkedin profile url', 'person linkedin profile url',
               'linkedinprofileurl', 'personlinkedinprofileurl', 'person linkedinprofileurl'
             ], row);
+            
+            // If not found, search all columns for LinkedIn URLs (fuzzy search)
+            if (!personLinkedinUrl || !personLinkedinUrl.trim()) {
+              for (const [key, value] of Object.entries(row)) {
+                if (!value || String(value).trim() === '') continue;
+                const keyLower = key.toLowerCase();
+                const valueStr = String(value).trim();
+                
+                // Check if column name suggests LinkedIn
+                if ((keyLower.includes('linkedin') || keyLower.includes('linked in') || keyLower.includes('lin')) && 
+                    !keyLower.includes('company')) {
+                  // Check if value looks like a URL
+                  if (valueStr.includes('linkedin.com') || valueStr.includes('linked.in') || valueStr.startsWith('http')) {
+                    personLinkedinUrl = valueStr;
+                    break;
+                  }
+                }
+                
+                // Also check if value itself is a LinkedIn URL (even if column name doesn't suggest it)
+                if (valueStr.includes('linkedin.com/in/') || valueStr.includes('linkedin.com/company/')) {
+                  // Only use if it's a person profile (not company)
+                  if (valueStr.includes('/in/')) {
+                    personLinkedinUrl = valueStr;
+                    break;
+                  }
+                }
+              }
+            }
             const website = extractFieldValue(normalizedRow, 'website', ['web', 'url', 'websiteurl', 'website url', 'site', 'webaddress', 'web address'], row);
             const companyLinkedinUrl = extractFieldValue(normalizedRow, 'companyLinkedinUrl', ['companylinkedinurl', 'company linkedin url', 'companylinkedin', 'company linkedin', 'companylinkedinprofile', 'company linkedin profile'], row);
             const facebookUrl = extractFieldValue(normalizedRow, 'facebookUrl', ['facebookurl', 'facebook url', 'facebook', 'fb', 'fburl', 'fb url'], row);
@@ -2948,27 +3235,39 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               return; // Skip empty rows silently
             }
 
-            // Validate required fields
+            // Validate required fields - ONLY use actual data from the file, no defaults
             const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.toString().trim()) ? personLinkedinUrl.toString().trim() : '';
             if (!trimmedPersonLinkedinUrl) {
-              // Log available columns for debugging (only for first error to avoid spam)
-              if (errors.length === 0 && rowNumber === 1) {
+              // Log available columns for debugging (only for first few errors to avoid spam)
+              if (errors.length < 3) {
+                console.log('=== EXCEL ROW DEBUG ===');
+                console.log('Row number:', rowNumber + 1);
                 console.log('Available Excel columns:', Object.keys(row));
+                console.log('Full row data:', row);
                 console.log('Normalized row keys:', Object.keys(normalizedRow));
+                console.log('Extracted values:', {
+                  name: name || '(empty)',
+                  email: email || '(empty)',
+                  company: company || '(empty)',
+                  personLinkedinUrl: personLinkedinUrl || '(empty)'
+                });
+                console.log('======================');
               }
               errors.push(`Row ${rowNumber + 1}: Person Linkedin Url is required`);
               return; // Skip this row
             }
 
-            // Generate default values for required fields
-            // Handle empty strings properly - always create a contact if we have any data
-            // If we have email or company but no name, still create the contact
-            const trimmedName = (name && name.toString().trim()) ? name.toString().trim() : 
-              (email && email.toString().trim()) ? email.toString().trim().split('@')[0] : 
-              (company && company.toString().trim()) ? company.toString().trim() : 
-              `Contact ${rowNumber + 1}`;
-            let trimmedEmail = (email && email.toString().trim()) ? email.toString().trim().toLowerCase() : `contact${rowNumber + 1}@unknown.com`;
-            const trimmedCompany = (company && company.toString().trim()) ? company.toString().trim() : 'Unknown Company';
+            // ONLY use actual data from the file - NO default values
+            // If a field is missing in the Excel file, it should remain empty, not be filled with defaults
+            const trimmedName = (name && name.toString().trim()) ? name.toString().trim() : '';
+            const trimmedEmail = (email && email.toString().trim()) ? email.toString().trim().toLowerCase() : '';
+            const trimmedCompany = (company && company.toString().trim()) ? company.toString().trim() : '';
+            
+            // Validate that we have at least name or company (required fields)
+            if (!trimmedName && !trimmedCompany) {
+              errors.push(`Row ${rowNumber + 1}: Name or Company is required`);
+              return; // Skip this row
+            }
 
             // Create contact object with all fields
             contacts.push({
@@ -3217,18 +3516,33 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
           });
 
           // Get values using flexible field matching (pass original row for additional matching)
-          // Handle First Name + Last Name combination for name field
-          // Try to get Name field first
-          const fullName = extractFieldValue(normalizedRow, 'name', ['fullname', 'contactname', 'personname', 'full name', 'contact name', 'person name', 'name'], mappedRow);
-          // Try to get First Name and Last Name separately
+          // IMPORTANT: Extract First Name and Last Name FIRST before checking for Full Name
+          // This ensures we get separate First/Last names when they exist as separate columns
           const firstName = extractFieldValue(normalizedRow, 'firstname', ['firstname', 'first name'], mappedRow);
           const lastName = extractFieldValue(normalizedRow, 'lastname', ['lastname', 'last name'], mappedRow);
           
+          // Try to get Full Name field
+          const fullName = extractFieldValue(normalizedRow, 'name', ['fullname', 'contactname', 'personname', 'full name', 'contact name', 'person name', 'name'], mappedRow);
+          
           let name = '';
-          // Priority: Use full Name if available, otherwise combine First + Last
-          if (fullName && fullName.trim()) {
+          // Priority logic:
+          // 1. If we have both First Name and Last Name as separate columns, combine them
+          // 2. Otherwise, use Full Name if available
+          // 3. Otherwise, use First Name or Last Name alone if available
+          if (firstName && firstName.trim() && lastName && lastName.trim()) {
+            // We have both First and Last Name - combine them
+            name = `${firstName.trim()} ${lastName.trim()}`.trim();
+          } else if (firstName && firstName.trim()) {
+            // Only First Name available
+            name = firstName.trim();
+          } else if (lastName && lastName.trim()) {
+            // Only Last Name available
+            name = lastName.trim();
+          } else if (fullName && fullName.trim()) {
+            // Use Full Name if available
             name = fullName.trim();
           } else if ((firstName && firstName.trim()) || (lastName && lastName.trim())) {
+            // Fallback: combine whatever we have
             const first = firstName && firstName.trim() ? firstName.trim() : '';
             const last = lastName && lastName.trim() ? lastName.trim() : '';
             name = [first, last].filter(Boolean).join(' ').trim();
@@ -3314,15 +3628,17 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             continue; // Skip this row
           }
 
-          // Generate default values for required fields
-          // Handle empty strings properly - always create a contact if we have any data
-          // If we have email or company but no name, still create the contact
-          const trimmedName = (name && name.trim()) ? name.trim() : 
-            (email && email.trim()) ? email.split('@')[0] : 
-            (company && company.trim()) ? company.trim() : 
-            `Contact ${rowNumber}`;
-          let trimmedEmail = (email && email.trim()) ? email.trim().toLowerCase() : `contact${rowNumber}@unknown.com`;
-          const trimmedCompany = (company && company.trim()) ? company.trim() : 'Unknown Company';
+          // ONLY use actual data from the file - NO default values
+          // If a field is missing in the CSV file, it should remain empty, not be filled with defaults
+          const trimmedName = (name && name.toString().trim()) ? name.toString().trim() : '';
+          const trimmedEmail = (email && email.toString().trim()) ? email.toString().trim().toLowerCase() : '';
+          const trimmedCompany = (company && company.toString().trim()) ? company.toString().trim() : '';
+          
+          // Validate that we have at least name or company (required fields)
+          if (!trimmedName && !trimmedCompany) {
+            errors.push(`Row ${i + 1}: Name or Company is required`);
+            continue; // Skip this row
+          }
 
           // Create contact object with all fields
           contacts.push({
@@ -3361,11 +3677,25 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       console.log(`CSV parsing completed. Processed ${allLines.length - 1} rows, created ${contacts.length} contacts.`);
     }
 
-    // Log debugging information
+    // Log debugging information - show what was actually imported
+    console.log(`=== BULK IMPORT SUMMARY ===`);
     console.log(`Parsed ${contacts.length} contacts from file`);
+    if (contacts.length > 0) {
+      console.log(`Sample of first 3 contacts being imported:`);
+      contacts.slice(0, 3).forEach((contact, idx) => {
+        console.log(`Contact ${idx + 1}:`, {
+          name: contact.name || '(empty)',
+          email: contact.email || '(empty)',
+          company: contact.company || '(empty)',
+          title: contact.title || '(empty)',
+          personLinkedinUrl: contact.personLinkedinUrl ? 'Present' : '(empty)'
+        });
+      });
+    }
     if (errors.length > 0) {
       console.log(`Encountered ${errors.length} errors during parsing:`, errors.slice(0, 5));
     }
+    console.log(`==========================`);
     
     if (contacts.length === 0) {
       // Provide more helpful error message
@@ -3384,113 +3714,36 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
       });
     }
 
-    // Handle duplicate emails in the file by making them unique
-    const emailSet = new Set();
-    let duplicatesInFile = 0;
-    const uniqueContacts = contacts.map((contact, index) => {
-      let email = contact.email;
-      let counter = 1;
-      const originalEmail = email;
-      
-      // If email already exists in this batch, make it unique by appending a number
-      while (emailSet.has(email.toLowerCase())) {
-        if (counter === 1) {
-          duplicatesInFile++; // Count the duplicate
-        }
-        const baseEmail = originalEmail.includes('@') 
-          ? originalEmail.split('@')[0] 
-          : `contact${index + 1}`;
-        const domain = originalEmail.includes('@') 
-          ? originalEmail.split('@')[1] 
-          : 'unknown.com';
-        email = `${baseEmail}${counter}@${domain}`;
-        counter++;
-      }
-      
-      emailSet.add(email.toLowerCase());
+    // ALLOW DUPLICATES: Process all contacts as new contacts, even if they have duplicate emails
+    // This allows the same contact to be imported multiple times
+    const contactsToImport = contacts.map((contact) => {
+      // Ensure email is properly formatted (if it exists)
+      if (contact.email && contact.email.trim() && contact.email.includes('@')) {
       return {
         ...contact,
-        email: email
-      };
-    });
-
-    // Check for existing prospect contacts in database (case-insensitive email matching)
-    const emailsToCheck = uniqueContacts.map(c => c.email.toLowerCase());
-    
-    // Fetch all prospect contacts and filter case-insensitively
-    // Using $in with all possible case variations would be inefficient, so we fetch and filter
-    const allPossibleEmails = [...new Set(emailsToCheck)];
-    const existingEmails = await ProspectContact.find({
-      $or: allPossibleEmails.map(email => ({
-        email: { $regex: new RegExp(`^${email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
-      }))
-    }).select('_id email').lean();
-
-    // Create maps for case-insensitive matching
-    const existingEmailMap = new Map();
-    existingEmails.forEach(c => {
-      const emailLower = c.email.toLowerCase();
-      if (!existingEmailMap.has(emailLower)) {
-        existingEmailMap.set(emailLower, c._id);
-      }
-    });
-
-    // Separate new contacts and existing contacts
-    const newContacts = [];
-    const existingContacts = [];
-    const seenEmails = new Set();
-
-    uniqueContacts.forEach(contact => {
-      const emailLower = contact.email.toLowerCase();
-      
-      // Skip if we've already processed this email in this batch
-      if (seenEmails.has(emailLower)) {
-        return;
-      }
-      seenEmails.add(emailLower);
-      
-      if (existingEmailMap.has(emailLower)) {
-        existingContacts.push({
-          ...contact,
-          contactId: existingEmailMap.get(emailLower)
-        });
+          email: contact.email.trim().toLowerCase()
+        };
       } else {
-        newContacts.push(contact);
+        // No email - keep it empty
+        return {
+          ...contact,
+          email: contact.email || ''
+        };
       }
     });
+
+    // ALL contacts will be treated as new contacts (allow duplicates)
+    const newContacts = contactsToImport;
+    const existingContacts = []; // No existing contacts - all are new
 
     // Create new contacts in database
     let createdContacts = [];
     if (newContacts.length > 0) {
       try {
-        // Check for duplicates by email before inserting
-        const emailsToInsert = newContacts.map(c => c.email);
-        const existingByEmail = await ProspectContact.find({
-          email: { $in: emailsToInsert }
-        }).select('_id email').lean();
-        
-        const existingEmailsSet = new Set(existingByEmail.map(c => c.email.toLowerCase()));
-        const contactsToInsert = newContacts.filter(c => !existingEmailsSet.has(c.email.toLowerCase()));
-        const duplicateEmails = newContacts.filter(c => existingEmailsSet.has(c.email.toLowerCase()));
-        
-        if (duplicateEmails.length > 0) {
-          console.log(`Skipping ${duplicateEmails.length} prospect contacts that already exist in database`);
-          // Add existing contacts to existingContacts array
-          duplicateEmails.forEach(dupContact => {
-            const existing = existingByEmail.find(e => e.email.toLowerCase() === dupContact.email.toLowerCase());
-            if (existing) {
-              existingContacts.push({
-                ...dupContact,
-                contactId: existing._id
-              });
-            }
-          });
-        }
-        
-        if (contactsToInsert.length > 0) {
-          createdContacts = await ProspectContact.insertMany(contactsToInsert, { ordered: false });
-          console.log(`✓ Created ${createdContacts.length} new prospect contacts in ProspectContact collection`);
-        }
+        // Insert ALL contacts (duplicates allowed)
+        // No duplicate checking - all contacts from file are inserted as new
+        createdContacts = await ProspectContact.insertMany(newContacts, { ordered: false });
+        console.log(`✓ Created ${createdContacts.length} prospect contacts in ProspectContact collection (duplicates allowed)`);
       } catch (insertError) {
         // Handle partial inserts (some might succeed)
         if (insertError.writeErrors) {
@@ -3499,173 +3752,43 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
           const insertedIds = insertError.insertedIds || {};
           createdContacts = Object.values(insertedIds).map(id => ({ _id: id }));
           
-          // Handle duplicate key errors - add to existing contacts
-          const duplicateErrors = insertError.writeErrors.filter(err => err.code === 11000);
-          if (duplicateErrors.length > 0) {
-            // Try to find these contacts by email
-            const duplicateEmails = duplicateErrors.map(err => {
-              const doc = err.op;
-              return doc.email;
-            });
-            const existingDups = await ProspectContact.find({
-              email: { $in: duplicateEmails }
-            }).select('_id email').lean();
-            
-            existingDups.forEach(existing => {
-              const dupContact = newContacts.find(c => c.email.toLowerCase() === existing.email.toLowerCase());
-              if (dupContact) {
-                existingContacts.push({
-                  ...dupContact,
-                  contactId: existing._id
-                });
-              }
-            });
-          }
+          // Log errors but continue - duplicates are allowed
+          // Note: If there are unique index constraints on email, some inserts may fail
+          // But we allow duplicates, so we'll continue with successfully inserted contacts
+          console.log(`Note: Some contacts had insertion errors, but duplicates are allowed`);
         } else {
           throw insertError;
         }
       }
     }
 
-    // Link all contacts (new and existing) to the project
+    // Link all contacts to the project (allow duplicates - create ProjectContact for all imported contacts)
     const projectContacts = [];
     let skipped = 0;
 
-    // Check for existing project-contact links (prevent duplicates)
-    const allContactIds = [
-      ...createdContacts.map(c => c._id),
-      ...existingContacts.map(c => c.contactId)
-    ].filter(id => id); // Remove any undefined/null IDs
+    // Get all contact IDs that were just created
+    const allContactIds = createdContacts.map(c => c._id).filter(id => id);
 
-    // Remove duplicates from allContactIds array itself
-    const uniqueContactIds = [...new Set(allContactIds.map(id => id.toString()))].map(id => new mongoose.Types.ObjectId(id));
-
+    // Check for existing project-contact links to avoid duplicate ProjectContact entries
+    // But still allow duplicate ProspectContact entries
     const existingProjectContacts = await ProjectContact.find({
       projectId: project._id,
-      contactId: { $in: uniqueContactIds }
+      contactId: { $in: allContactIds }
     }).select('contactId').lean();
 
     const existingProjectContactSet = new Set(
       existingProjectContacts.map(pc => pc.contactId.toString())
     );
 
-    // Create project-contact links for new contacts
+    // Create project-contact links for ALL imported contacts
+    // Even if they have duplicate emails, each gets its own ProjectContact entry
     for (const contact of createdContacts) {
+      // Check if this specific contact ID already has a ProjectContact entry
+      // This prevents duplicate ProjectContact entries for the same contact ID
       if (!existingProjectContactSet.has(contact._id.toString())) {
         projectContacts.push({
           projectId: project._id,
           contactId: contact._id,
-          stage: defaultStage || 'New',
-          assignedTo: assignTo || project.assignedTo || '',
-          createdBy: req.user._id
-        });
-      } else {
-        skipped++;
-      }
-    }
-
-    // Update existing prospect contacts with imported data (fill in missing fields or update with new data)
-    if (existingContacts.length > 0) {
-      const updatePromises = existingContacts.map(async (contact) => {
-        try {
-          const existingContact = await ProspectContact.findById(contact.contactId);
-          if (existingContact) {
-            const updateData = {};
-            
-            // Update fields if they're provided in import and missing or different in existing contact
-            if (contact.name && contact.name.trim() !== '' && (!existingContact.name || existingContact.name.trim() === '')) {
-              updateData.name = contact.name;
-            }
-            if (contact.company && contact.company.trim() !== '' && (!existingContact.company || existingContact.company.trim() === '')) {
-              updateData.company = contact.company;
-            }
-            if (contact.title && contact.title.trim() !== '' && (!existingContact.title || existingContact.title.trim() === '')) {
-              updateData.title = contact.title;
-            }
-            if (contact.firstPhone && contact.firstPhone.trim() !== '' && (!existingContact.firstPhone || existingContact.firstPhone.trim() === '')) {
-              updateData.firstPhone = contact.firstPhone;
-            }
-            if (contact.employees && contact.employees.trim() !== '' && (!existingContact.employees || existingContact.employees.trim() === '')) {
-              updateData.employees = contact.employees;
-            }
-            if (contact.category && contact.category.trim() !== '' && (!existingContact.category || existingContact.category.trim() === '')) {
-              updateData.category = contact.category;
-            }
-            if (contact.industry && contact.industry.trim() !== '' && (!existingContact.industry || existingContact.industry.trim() === '')) {
-              updateData.industry = contact.industry;
-            }
-            if (contact.keywords && contact.keywords.trim() !== '' && (!existingContact.keywords || existingContact.keywords.trim() === '')) {
-              updateData.keywords = contact.keywords;
-            }
-            if (contact.personLinkedinUrl && contact.personLinkedinUrl.trim() !== '' && (!existingContact.personLinkedinUrl || existingContact.personLinkedinUrl.trim() === '')) {
-              updateData.personLinkedinUrl = contact.personLinkedinUrl;
-            }
-            if (contact.website && contact.website.trim() !== '' && (!existingContact.website || existingContact.website.trim() === '')) {
-              updateData.website = contact.website;
-            }
-            if (contact.companyLinkedinUrl && contact.companyLinkedinUrl.trim() !== '' && (!existingContact.companyLinkedinUrl || existingContact.companyLinkedinUrl.trim() === '')) {
-              updateData.companyLinkedinUrl = contact.companyLinkedinUrl;
-            }
-            if (contact.facebookUrl && contact.facebookUrl.trim() !== '' && (!existingContact.facebookUrl || existingContact.facebookUrl.trim() === '')) {
-              updateData.facebookUrl = contact.facebookUrl;
-            }
-            if (contact.twitterUrl && contact.twitterUrl.trim() !== '' && (!existingContact.twitterUrl || existingContact.twitterUrl.trim() === '')) {
-              updateData.twitterUrl = contact.twitterUrl;
-            }
-            if (contact.city && contact.city.trim() !== '' && (!existingContact.city || existingContact.city.trim() === '')) {
-              updateData.city = contact.city;
-            }
-            if (contact.state && contact.state.trim() !== '' && (!existingContact.state || existingContact.state.trim() === '')) {
-              updateData.state = contact.state;
-            }
-            if (contact.country && contact.country.trim() !== '' && (!existingContact.country || existingContact.country.trim() === '')) {
-              updateData.country = contact.country;
-            }
-            if (contact.companyAddress && contact.companyAddress.trim() !== '' && (!existingContact.companyAddress || existingContact.companyAddress.trim() === '')) {
-              updateData.companyAddress = contact.companyAddress;
-            }
-            if (contact.companyCity && contact.companyCity.trim() !== '' && (!existingContact.companyCity || existingContact.companyCity.trim() === '')) {
-              updateData.companyCity = contact.companyCity;
-            }
-            if (contact.companyState && contact.companyState.trim() !== '' && (!existingContact.companyState || existingContact.companyState.trim() === '')) {
-              updateData.companyState = contact.companyState;
-            }
-            if (contact.companyCountry && contact.companyCountry.trim() !== '' && (!existingContact.companyCountry || existingContact.companyCountry.trim() === '')) {
-              updateData.companyCountry = contact.companyCountry;
-            }
-            if (contact.companyPhone && contact.companyPhone.trim() !== '' && (!existingContact.companyPhone || existingContact.companyPhone.trim() === '')) {
-              updateData.companyPhone = contact.companyPhone;
-            }
-            if (contact.seoDescription && contact.seoDescription.trim() !== '' && (!existingContact.seoDescription || existingContact.seoDescription.trim() === '')) {
-              updateData.seoDescription = contact.seoDescription;
-            }
-            if (contact.technologies && contact.technologies.trim() !== '' && (!existingContact.technologies || existingContact.technologies.trim() === '')) {
-              updateData.technologies = contact.technologies;
-            }
-            if (contact.annualRevenue && contact.annualRevenue.trim() !== '' && (!existingContact.annualRevenue || existingContact.annualRevenue.trim() === '')) {
-              updateData.annualRevenue = contact.annualRevenue;
-            }
-            
-            // Update if there are any fields to update
-            if (Object.keys(updateData).length > 0) {
-              await ProspectContact.findByIdAndUpdate(contact.contactId, updateData);
-              console.log(`Updated prospect contact ${contact.contactId} with imported data`);
-            }
-          }
-        } catch (updateError) {
-          console.error(`Error updating contact ${contact.contactId}:`, updateError);
-        }
-      });
-      
-      await Promise.all(updatePromises);
-    }
-
-    // Create project-contact links for existing contacts
-    for (const contact of existingContacts) {
-      if (!existingProjectContactSet.has(contact.contactId.toString())) {
-        projectContacts.push({
-          projectId: project._id,
-          contactId: contact.contactId,
           stage: defaultStage || 'New',
           assignedTo: assignTo || project.assignedTo || '',
           createdBy: req.user._id
@@ -3704,16 +3827,16 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
 
     // Calculate final imported count (actual ProjectContact documents created)
     const imported = projectContactsCreated;
-    const totalSkipped = skipped + duplicatesInFile;
+    const totalSkipped = skipped;
 
     const newContactsCount = createdContacts.length;
-    const existingContactsCount = existingContacts.length;
+    const existingContactsCount = 0; // No existing contacts - all are new (duplicates allowed)
     
     console.log(`\n=== Bulk Import Summary ===`);
-    console.log(`✓ ProspectContact Collection: ${newContactsCount} new prospect contacts created, ${existingContactsCount} existing prospect contacts updated`);
+    console.log(`✓ ProspectContact Collection: ${newContactsCount} prospect contacts created (duplicates allowed)`);
     console.log(`✓ ProjectContact Collection: ${projectContactsCreated} project-contact links created`);
     console.log(`✓ Total imported to project: ${imported} prospects`);
-    console.log(`✓ Skipped: ${totalSkipped} (${duplicatesInFile} duplicates in file, ${skipped} already in project)`);
+    console.log(`✓ Skipped: ${totalSkipped} (already linked to this project)`);
     console.log(`✓ Errors: ${errors.length}`);
     console.log(`===========================\n`);
 
@@ -3724,13 +3847,13 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
         skipped: totalSkipped,
         errors: errors.length,
         total: contacts.length,
-        duplicatesInFile: duplicatesInFile,
+        duplicatesInFile: 0, // Duplicates are now allowed
         alreadyInProject: skipped,
         newContactsInDatabank: newContactsCount,
         existingContactsInDatabank: existingContactsCount,
         projectContactsCreated: projectContactsCreated
       },
-      message: `Successfully imported ${imported} prospects. ${newContactsCount > 0 ? `${newContactsCount} new prospect contacts saved to ProspectContact collection.` : ''} ${existingContactsCount > 0 ? `${existingContactsCount} existing prospect contacts updated in ProspectContact collection.` : ''} ${projectContactsCreated > 0 ? `${projectContactsCreated} ProjectContact links created.` : ''} ${totalSkipped > 0 ? `${totalSkipped} duplicates skipped.` : ''}`
+      message: `Successfully imported ${imported} prospects. ${newContactsCount > 0 ? `${newContactsCount} prospect contacts saved to ProspectContact collection (duplicates allowed).` : ''} ${projectContactsCreated > 0 ? `${projectContactsCreated} ProjectContact links created.` : ''} ${totalSkipped > 0 ? `${totalSkipped} already linked to this project.` : ''}`
     });
   } catch (error) {
     console.error('Error importing prospects:', error);
@@ -3819,70 +3942,6 @@ router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, 
     res.status(400).json({
       success: false,
       error: error.message || 'Failed to update project-contact'
-    });
-  }
-});
-
-// Delete project contacts (bulk remove prospects from project)
-router.delete('/:projectId/project-contacts', authenticate, async (req, res) => {
-  try {
-    const { projectId } = req.params;
-    const { contactIds } = req.body; // Array of contact IDs to remove
-
-    // Validate projectId ObjectId
-    if (!mongoose.Types.ObjectId.isValid(projectId)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid project ID format'
-      });
-    }
-
-    if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Contact IDs array is required'
-      });
-    }
-
-    // Validate all contact IDs are valid ObjectIds
-    const invalidContactIds = contactIds.filter(id => !mongoose.Types.ObjectId.isValid(id));
-    if (invalidContactIds.length > 0) {
-      return res.status(400).json({
-        success: false,
-        error: `Invalid contact ID(s): ${invalidContactIds.join(', ')}`
-      });
-    }
-
-    // Verify project exists
-    const project = await Project.findOne({ _id: projectId });
-    if (!project) {
-      return res.status(404).json({
-        success: false,
-        error: 'Project not found'
-      });
-    }
-
-    // Convert contact IDs to ObjectIds
-    const contactObjectIds = contactIds.map(id => new mongoose.Types.ObjectId(id));
-
-    // Delete project-contact links
-    const result = await ProjectContact.deleteMany({
-      projectId: projectId,
-      contactId: { $in: contactObjectIds }
-    });
-
-    res.json({
-      success: true,
-      message: `Successfully removed ${result.deletedCount} prospect(s) from project`,
-      data: {
-        deletedCount: result.deletedCount
-      }
-    });
-  } catch (error) {
-    console.error('Error removing prospects from project:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to remove prospects from project'
     });
   }
 });

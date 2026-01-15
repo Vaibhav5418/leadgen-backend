@@ -126,8 +126,14 @@ router.post('/', authenticate, async (req, res) => {
               { stage: mostRecentActivity.status },
               { upsert: false } // Don't create if it doesn't exist
             );
+          } else {
+            // If no activity with status exists, set stage to 'New'
+            await ProjectContact.findOneAndUpdate(
+              { projectId: projectId, contactId: contactId },
+              { stage: 'New' },
+              { upsert: false } // Don't create if it doesn't exist
+            );
           }
-          // If no activity with status exists, don't update - keep existing stage or default to 'New'
         }
       } catch (updateError) {
         // Log error but don't fail the activity creation
@@ -189,6 +195,19 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
 router.get('/contact/:contactId', authenticate, async (req, res) => {
   try {
     const contactObjectId = new mongoose.Types.ObjectId(req.params.contactId);
+    const projectId = req.query.projectId; // Get projectId from query parameter (optional)
+    
+    // Validate projectId if provided
+    let projectObjectId = null;
+    if (projectId) {
+      if (!mongoose.Types.ObjectId.isValid(projectId)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid project ID format'
+        });
+      }
+      projectObjectId = new mongoose.Types.ObjectId(projectId);
+    }
     
     // First verify the contact exists in either ProspectContact or Contact (legacy)
     const [prospectContact, legacyContact] = await Promise.all([
@@ -203,9 +222,16 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
       });
     }
     
+    // Build match criteria - filter by contactId and optionally by projectId
+    // This ensures activities are project-specific when projectId is provided
+    const matchCriteria = { contactId: contactObjectId };
+    if (projectObjectId) {
+      matchCriteria.projectId = projectObjectId; // Only show activities for this specific project
+    }
+    
     // Use aggregation for better performance - lookup from both ProspectContact and Contact collections
     const activities = await Activity.aggregate([
-      { $match: { contactId: contactObjectId } },
+      { $match: matchCriteria },
       {
         $lookup: {
           from: 'projects',
@@ -419,8 +445,14 @@ router.put('/:id', authenticate, async (req, res) => {
               { stage: mostRecentActivity.status },
               { upsert: false } // Don't create if it doesn't exist
             );
+          } else {
+            // If no activity with status exists, set stage to 'New'
+            await ProjectContact.findOneAndUpdate(
+              { projectId: activity.projectId, contactId: activity.contactId },
+              { stage: 'New' },
+              { upsert: false } // Don't create if it doesn't exist
+            );
           }
-          // If no activity with status exists, don't update - keep existing stage
         }
       } catch (updateError) {
         // Log error but don't fail the activity update
