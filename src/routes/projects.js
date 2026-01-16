@@ -848,7 +848,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         }
       ]),
       
-      // LinkedIn Funnel
+      // LinkedIn Funnel - get most recent activity per contact
       Activity.aggregate([
         {
           $match: {
@@ -857,12 +857,20 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
           }
         },
         {
+          // Sort by date to ensure most recent activity first
+          $sort: {
+            linkedinDate: -1,
+            createdAt: -1
+          }
+        },
+        {
           $group: {
             _id: '$contactId',
-            linkedinDate: { $max: '$linkedinDate' },
-            status: { $last: '$status' },
-            lnRequestSent: { $last: '$lnRequestSent' },
-            connected: { $last: '$connected' }
+            linkedinDate: { $first: '$linkedinDate' },
+            status: { $first: '$status' },
+            lnRequestSent: { $first: '$lnRequestSent' },
+            connected: { $first: '$connected' },
+            createdAt: { $first: '$createdAt' }
           }
         }
       ]),
@@ -1113,17 +1121,83 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       sql: emailFunnel.filter(e => e.status === 'SQL' || e.status === 'Meeting Completed').length
     };
     
-    // Calculate LinkedIn Funnel
+    // Calculate LinkedIn Funnel - prioritize most recent status
+    // Use Sets to track unique contacts at each stage, with hierarchical logic
+    const linkedinConnectionSentSet = new Set();
+    const linkedinAcceptedSet = new Set();
+    const linkedinCipSet = new Set();
+    const linkedinMeetingProposedSet = new Set();
+    const linkedinScheduledSet = new Set();
+    const linkedinCompletedSet = new Set();
+    const linkedinSqlSet = new Set();
+    
+    linkedinFunnel.forEach(l => {
+      const contactId = l._id?.toString();
+      if (!contactId) return;
+      
+      // Connection Request Sent
+      if (l.lnRequestSent === 'Yes' || l.lnRequestSent === true) {
+        linkedinConnectionSentSet.add(contactId);
+      }
+      
+      // Determine the contact's current stage based on most recent status
+      const currentStatus = l.status;
+      
+      // If status is CIP or higher, don't count in 'accepted' anymore
+      // Accepted stage: connection accepted but status is empty or not CIP/higher
+      if ((l.connected === 'Yes' || l.connected === true) && 
+          (!currentStatus || currentStatus === '' || 
+           (!['CIP', 'Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'SQL'].includes(currentStatus)))) {
+        linkedinAcceptedSet.add(contactId);
+      }
+      
+      // CIP - only if status is explicitly CIP
+      if (currentStatus === 'CIP') {
+        linkedinCipSet.add(contactId);
+        // Remove from accepted if in CIP
+        linkedinAcceptedSet.delete(contactId);
+      }
+      
+      // Meeting Proposed
+      if (currentStatus === 'Meeting Proposed') {
+        linkedinMeetingProposedSet.add(contactId);
+        linkedinAcceptedSet.delete(contactId);
+        linkedinCipSet.delete(contactId);
+      }
+      
+      // Meeting Scheduled
+      if (currentStatus === 'Meeting Scheduled') {
+        linkedinScheduledSet.add(contactId);
+        linkedinAcceptedSet.delete(contactId);
+        linkedinCipSet.delete(contactId);
+        linkedinMeetingProposedSet.delete(contactId);
+      }
+      
+      // Meeting Completed
+      if (currentStatus === 'Meeting Completed') {
+        linkedinCompletedSet.add(contactId);
+        linkedinAcceptedSet.delete(contactId);
+        linkedinCipSet.delete(contactId);
+        linkedinMeetingProposedSet.delete(contactId);
+        linkedinScheduledSet.delete(contactId);
+      }
+      
+      // SQL
+      if (currentStatus === 'SQL' || currentStatus === 'Meeting Completed') {
+        linkedinSqlSet.add(contactId);
+      }
+    });
+    
     const linkedinFunnelData = {
       prospectData: totalProspects,
-      connectionSent: linkedinFunnel.filter(l => l.lnRequestSent === 'Yes' || l.lnRequestSent === true).length,
-      accepted: linkedinFunnel.filter(l => l.connected === 'Yes' || l.connected === true).length,
-      followups: linkedinFunnel.filter(l => l.status && l.status !== 'CIP').length,
-      cip: linkedinFunnel.filter(l => l.status === 'CIP').length,
-      meetingProposed: linkedinFunnel.filter(l => l.status === 'Meeting Proposed').length,
-      scheduled: linkedinFunnel.filter(l => l.status === 'Meeting Scheduled').length,
-      completed: linkedinFunnel.filter(l => l.status === 'Meeting Completed').length,
-      sql: linkedinFunnel.filter(l => l.status === 'SQL' || l.status === 'Meeting Completed').length
+      connectionSent: linkedinConnectionSentSet.size,
+      accepted: linkedinAcceptedSet.size,
+      followups: linkedinFunnel.filter(l => l.status && l.status !== 'CIP' && l.status !== '').length,
+      cip: linkedinCipSet.size,
+      meetingProposed: linkedinMeetingProposedSet.size,
+      scheduled: linkedinScheduledSet.size,
+      completed: linkedinCompletedSet.size,
+      sql: linkedinSqlSet.size
     };
     
     // Process conversion metrics
