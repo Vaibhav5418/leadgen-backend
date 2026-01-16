@@ -2530,16 +2530,32 @@ router.delete('/:projectId/project-contacts', authenticate, async (req, res) => 
     const contactObjectIds = contactIds.map(id => new mongoose.Types.ObjectId(id));
 
     // Delete project-contact links
-    const result = await ProjectContact.deleteMany({
+    const projectContactResult = await ProjectContact.deleteMany({
       projectId: projectId,
       contactId: { $in: contactObjectIds }
     });
 
+    // Also delete prospects from ProspectContact collection (database)
+    const prospectContactResult = await ProspectContact.deleteMany({
+      _id: { $in: contactObjectIds }
+    });
+
+    // Also delete related activities for these contacts in this project
+    const activityResult = await Activity.deleteMany({
+      projectId: projectId,
+      contactId: { $in: contactObjectIds }
+    });
+
+    const totalDeleted = projectContactResult.deletedCount;
+
     res.json({
       success: true,
-      message: `Successfully removed ${result.deletedCount} prospect(s) from project`,
+      message: `Successfully deleted ${totalDeleted} prospect(s) from project and database`,
       data: {
-        deletedCount: result.deletedCount
+        deletedCount: totalDeleted,
+        projectContactsDeleted: projectContactResult.deletedCount,
+        prospectsDeleted: prospectContactResult.deletedCount,
+        activitiesDeleted: activityResult.deletedCount
       }
     });
   } catch (error) {
