@@ -119,6 +119,11 @@ const contactSchema = new mongoose.Schema({
   lastLinkedInFetch: {
     type: Date,
     default: null
+  },
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
   }
 }, {
   timestamps: true
@@ -152,5 +157,6 @@ contactSchema.index({ category: 1, createdAt: -1 }); // For category filtering w
 contactSchema.index({ company: 1, createdAt: -1 }); // For company filtering with sorting
 contactSchema.index({ email: 1, createdAt: -1 }); // For email queries with sorting
 contactSchema.index({ name: 1, email: 1 }); // Compound index for duplicate checking
+contactSchema.index({ createdBy: 1 }); // Index for user-based filtering
 
 module.exports = mongoose.model('Contact', contactSchema);

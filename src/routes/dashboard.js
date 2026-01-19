@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Contact = require('../models/Contact');
+const authenticate = require('../middleware/auth');
 
 // In-memory cache for dashboard stats (5 minutes TTL)
 let dashboardCache = {
@@ -19,20 +20,23 @@ const isCacheValid = () => {
 };
 
 // Get dashboard statistics
-router.get('/stats', async (req, res) => {
-  // Check cache first
-  if (isCacheValid()) {
-    // Set cache headers
-    res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
-    res.set('X-Cache', 'HIT');
-    return res.json({
-      success: true,
-      data: dashboardCache.data,
-      cached: true
-    });
-  }
+router.get('/stats', authenticate, async (req, res) => {
+  const user = req.user;
+  const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
   
-  try {
+  // Check cache first (cache is per-user, so we'll skip caching for now or implement user-specific cache)
+  // For simplicity, we'll skip cache for now since it needs to be user-specific
+  // if (isCacheValid()) {
+  //   res.set('Cache-Control', 'public, max-age=300');
+  //   res.set('X-Cache', 'HIT');
+  //   return res.json({
+  //     success: true,
+  //     data: dashboardCache.data,
+  //     cached: true
+  //   });
+  // }
+  
+    try {
     // Calculate date ranges
     const now = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -42,6 +46,12 @@ router.get('/stats', async (req, res) => {
     const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 6, 1);
     const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
     const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    
+    // Build contact filter - add createdBy filter unless admin
+    let contactQueryFilter = {};
+    if (!isAdmin) {
+      contactQueryFilter.createdBy = user._id;
+    }
     
     // Run all count queries in parallel for better performance
     // Use lean() and select() to reduce memory usage and improve speed
@@ -59,33 +69,37 @@ router.get('/stats', async (req, res) => {
       dncContacts,
       contactsLastMonth
     ] = await Promise.all([
-      Contact.estimatedDocumentCount(), // Much faster than countDocuments() for large collections
-      Contact.distinct('company'),
-      Contact.countDocuments({ createdAt: { $gte: thisMonthStart } }),
-      Contact.countDocuments({ email: { $exists: true, $ne: '', $regex: /.+@.+\..+/ } }),
-      Contact.countDocuments({ email: { $regex: validEmailRegex } }),
-      Contact.countDocuments({ title: { $exists: true, $ne: '' } }),
+      Contact.countDocuments(contactQueryFilter), // Use countDocuments with filter instead of estimatedDocumentCount
+      Contact.distinct('company', contactQueryFilter),
+      Contact.countDocuments({ ...contactQueryFilter, createdAt: { $gte: thisMonthStart } }),
+      Contact.countDocuments({ ...contactQueryFilter, email: { $exists: true, $ne: '', $regex: /.+@.+\..+/ } }),
+      Contact.countDocuments({ ...contactQueryFilter, email: { $regex: validEmailRegex } }),
+      Contact.countDocuments({ ...contactQueryFilter, title: { $exists: true, $ne: '' } }),
       Contact.countDocuments({
+        ...contactQueryFilter,
         email: { $regex: validEmailRegex },
         title: { $exists: true, $ne: '' },
         company: { $exists: true, $ne: '' }
       }),
       Contact.countDocuments({
+        ...contactQueryFilter,
         $or: [
           { personLinkedinUrl: { $exists: true, $ne: '' } },
           { companyLinkedinUrl: { $exists: true, $ne: '' } }
         ]
       }),
-      Contact.countDocuments({ lastLinkedInFetch: { $lt: ninetyDaysAgo } }),
+      Contact.countDocuments({ ...contactQueryFilter, lastLinkedInFetch: { $lt: ninetyDaysAgo } }),
       Contact.countDocuments({
+        ...contactQueryFilter,
         $or: [
           { title: { $exists: false } },
           { title: '' },
           { title: null }
         ]
       }),
-      Contact.countDocuments({ email: { $in: ['', null] } }),
+      Contact.countDocuments({ ...contactQueryFilter, email: { $in: ['', null] } }),
       Contact.countDocuments({
+        ...contactQueryFilter,
         createdAt: { $gte: lastMonthStart, $lte: lastMonthEnd }
       })
     ]);
@@ -95,12 +109,16 @@ router.get('/stats', async (req, res) => {
     
     // Duplicate detection (optimized - run in parallel with other queries if possible)
     // For very large datasets, this can be expensive, so we'll limit the scope
+    const duplicateMatchFilter = {
+      name: { $exists: true, $ne: '', $ne: null },
+      email: { $exists: true, $ne: '', $ne: null }
+    };
+    if (!isAdmin) {
+      duplicateMatchFilter.createdBy = user._id;
+    }
     const duplicatePromise = Contact.aggregate([
       {
-        $match: {
-          name: { $exists: true, $ne: '', $ne: null },
-          email: { $exists: true, $ne: '', $ne: null }
-        }
+        $match: duplicateMatchFilter
       },
       {
         $group: {
@@ -143,15 +161,21 @@ router.get('/stats', async (req, res) => {
       const monthStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const monthEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 0);
       
+      const monthFilter = { createdAt: { $lte: monthEnd } };
+      const monthCompanyFilter = {
+        createdAt: { $lte: monthEnd },
+        company: { $exists: true, $ne: '', $ne: null }
+      };
+      if (!isAdmin) {
+        monthFilter.createdBy = user._id;
+        monthCompanyFilter.createdBy = user._id;
+      }
       monthQueries.push({
         monthStart,
         monthEnd,
         monthLabel: monthStart.toLocaleDateString('en-US', { month: 'short' }),
-        contactsPromise: Contact.countDocuments({ createdAt: { $lte: monthEnd } }),
-        companiesPromise: Contact.distinct('company', {
-          createdAt: { $lte: monthEnd },
-          company: { $exists: true, $ne: '', $ne: null }
-        })
+        contactsPromise: Contact.countDocuments(monthFilter),
+        companiesPromise: Contact.distinct('company', monthCompanyFilter)
       });
     }
     
@@ -175,9 +199,13 @@ router.get('/stats', async (req, res) => {
     const monthlyGrowth = monthResults;
     
     // Top industries with detailed stats (optimized)
+    const industryMatchFilter = { industry: { $exists: true, $ne: '', $ne: null } };
+    if (!isAdmin) {
+      industryMatchFilter.createdBy = user._id;
+    }
     const industryStats = await Contact.aggregate([
       {
-        $match: { industry: { $exists: true, $ne: '', $ne: null } }
+        $match: industryMatchFilter
       },
       {
         $group: {
@@ -249,12 +277,16 @@ router.get('/stats', async (req, res) => {
     // Calculate quarterly growth for each industry using optimized aggregation
     // Instead of individual queries, use a single aggregation pipeline
     const industryIds = industryStats.map(s => s._id).filter(id => id);
+    const industryGrowthMatchFilter = {
+      industry: { $in: industryIds },
+      createdAt: { $gte: sixMonthsAgo }
+    };
+    if (!isAdmin) {
+      industryGrowthMatchFilter.createdBy = user._id;
+    }
     const industryGrowthData = industryIds.length > 0 ? await Contact.aggregate([
       {
-        $match: {
-          industry: { $in: industryIds },
-          createdAt: { $gte: sixMonthsAgo }
-        }
+        $match: industryGrowthMatchFilter
       },
       {
         $group: {
@@ -351,10 +383,15 @@ router.get('/stats', async (req, res) => {
       recentActivity
     ] = await Promise.all([
       // Top countries (optimized)
-      Contact.aggregate([
-        {
-          $match: { country: { $exists: true, $ne: '', $ne: null } }
-        },
+      (() => {
+        const countryMatchFilter = { country: { $exists: true, $ne: '', $ne: null } };
+        if (!isAdmin) {
+          countryMatchFilter.createdBy = user._id;
+        }
+        return Contact.aggregate([
+          {
+            $match: countryMatchFilter
+          },
         {
           $group: {
             _id: '$country',
@@ -367,15 +404,21 @@ router.get('/stats', async (req, res) => {
         {
           $limit: 10
         }
-      ]).allowDiskUse(true),
+      ]).allowDiskUse(true);
+      })(),
       // Top states grouped by country
-      Contact.aggregate([
-        {
-          $match: { 
-            state: { $exists: true, $ne: '', $ne: null },
-            country: { $exists: true, $ne: '', $ne: null }
-          }
-        },
+      (() => {
+        const stateMatchFilter = { 
+          state: { $exists: true, $ne: '', $ne: null },
+          country: { $exists: true, $ne: '', $ne: null }
+        };
+        if (!isAdmin) {
+          stateMatchFilter.createdBy = user._id;
+        }
+        return Contact.aggregate([
+          {
+            $match: stateMatchFilter
+          },
         {
           $group: {
             _id: {
@@ -386,14 +429,20 @@ router.get('/stats', async (req, res) => {
           }
         },
         {
-          $sort: { count: -1 }
+          $sort: { count: -1           }
         }
-      ]).allowDiskUse(true),
+      ]).allowDiskUse(true);
+      })(),
       // Top states (for backward compatibility, showing top 5 overall)
-      Contact.aggregate([
-        {
-          $match: { state: { $exists: true, $ne: '', $ne: null } }
-        },
+      (() => {
+        const topStateMatchFilter = { state: { $exists: true, $ne: '', $ne: null } };
+        if (!isAdmin) {
+          topStateMatchFilter.createdBy = user._id;
+        }
+        return Contact.aggregate([
+          {
+            $match: topStateMatchFilter
+          },
         {
           $group: {
             _id: '$state',
@@ -406,17 +455,21 @@ router.get('/stats', async (req, res) => {
         {
           $limit: 5
         }
-      ]).allowDiskUse(true),
+      ]).allowDiskUse(true);
+      })(),
       // Enrichment status distribution
       Contact.countDocuments({
+        ...contactQueryFilter,
         personLinkedinUrl: { $exists: true, $ne: '' },
         companyLinkedinUrl: { $exists: true, $ne: '' }
       }),
       // Data quality metrics
       Contact.countDocuments({
+        ...contactQueryFilter,
         firstPhone: { $exists: true, $ne: '' }
       }),
       Contact.countDocuments({
+        ...contactQueryFilter,
         email: { $regex: validEmailRegex },
         firstPhone: { $exists: true, $ne: '' },
         title: { $exists: true, $ne: '' },
@@ -424,6 +477,7 @@ router.get('/stats', async (req, res) => {
       }),
       // Recent activity (contacts updated in last 30 days)
       Contact.countDocuments({
+        ...contactQueryFilter,
         updatedAt: { $gte: thirtyDaysAgo }
       })
     ]);

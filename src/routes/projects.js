@@ -192,6 +192,8 @@ router.patch('/:id/status', authenticate, async (req, res) => {
 router.get('/analytics', authenticate, async (req, res) => {
   try {
     const Activity = require('../models/Activity');
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
     const now = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -199,9 +201,19 @@ router.get('/analytics', authenticate, async (req, res) => {
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     
-    // Get all projects with basic stats
-    const projects = await Project.find().lean();
+    // Get projects filtered by user unless admin (for Project Management page)
+    let projectFilter = {};
+    if (!isAdmin) {
+      projectFilter.createdBy = user._id;
+    }
+    const projects = await Project.find(projectFilter).lean();
     const projectIds = projects.map(p => p._id);
+    
+    // Build activity filter - filter by user unless admin
+    const activityFilter = { projectId: { $in: projectIds } };
+    if (!isAdmin) {
+      activityFilter.createdBy = user._id;
+    }
     
     // Parallel queries for performance
     const [
@@ -222,30 +234,30 @@ router.get('/analytics', authenticate, async (req, res) => {
       activityTrends,
       recentActivities
     ] = await Promise.all([
-      // Basic counts
-      Project.countDocuments(),
-      Project.countDocuments({ status: 'active' }),
-      Project.countDocuments({ status: 'draft' }),
-      Project.countDocuments({ status: 'completed' }),
+      // Basic counts - use projectFilter
+      Project.countDocuments(projectFilter),
+      Project.countDocuments({ ...projectFilter, status: 'active' }),
+      Project.countDocuments({ ...projectFilter, status: 'draft' }),
+      Project.countDocuments({ ...projectFilter, status: 'completed' }),
       
       // Prospect counts - only from existing projects
       ProjectContact.countDocuments({ projectId: { $in: projectIds } }),
       
-      // Activity counts - only from existing projects
-      Activity.countDocuments({ projectId: { $in: projectIds } }),
+      // Activity counts - filter by user unless admin
+      Activity.countDocuments(activityFilter),
       
-      // Activities by type
+      // Activities by type - filter by user unless admin
       Activity.aggregate([
-        { $match: { projectId: { $in: projectIds } } },
+        { $match: activityFilter },
         { $group: { _id: '$type', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
       ]),
       
-      // Activities by date (last 30 days)
+      // Activities by date (last 30 days) - filter by user unless admin
       Activity.aggregate([
         { 
           $match: { 
-            projectId: { $in: projectIds },
+            ...activityFilter,
             createdAt: { $gte: thirtyDaysAgo }
           } 
         },
@@ -265,8 +277,9 @@ router.get('/analytics', authenticate, async (req, res) => {
         { $sort: { count: -1 } }
       ]),
       
-      // Channel usage across projects
+      // Channel usage across projects - use projectFilter
       Project.aggregate([
+        { $match: projectFilter },
         {
           $project: {
             linkedIn: { $cond: [{ $eq: ['$channels.linkedInOutreach', true] }, 1, 0] },
@@ -284,9 +297,9 @@ router.get('/analytics', authenticate, async (req, res) => {
         }
       ]),
       
-      // Team performance (activities per team member)
+      // Team performance (activities per team member) - filter by user unless admin
       Activity.aggregate([
-        { $match: { projectId: { $in: projectIds } } },
+        { $match: activityFilter },
         {
           $lookup: {
             from: 'users',
@@ -311,24 +324,35 @@ router.get('/analytics', authenticate, async (req, res) => {
         { $limit: 10 }
       ]),
       
-      // Project health metrics
-      Project.aggregate([
-        {
-          $lookup: {
-            from: 'projectcontacts',
-            localField: '_id',
-            foreignField: 'projectId',
-            as: 'contacts'
-          }
-        },
-        {
-          $lookup: {
-            from: 'activities',
-            localField: '_id',
-            foreignField: 'projectId',
-            as: 'activities'
-          }
-        },
+      // Project health metrics - filter by user unless admin
+      (() => {
+        const pipeline = [
+          { $match: projectFilter },
+          {
+            $lookup: {
+              from: 'projectcontacts',
+              localField: '_id',
+              foreignField: 'projectId',
+              as: 'contacts'
+            }
+          },
+          {
+            $lookup: {
+              from: 'activities',
+              let: { projectId: '$_id' },
+              pipeline: [
+                {
+                  $match: isAdmin 
+                    ? { $expr: { $eq: ['$projectId', '$$projectId'] } }
+                    : {
+                        $expr: { $eq: ['$projectId', '$$projectId'] },
+                        createdBy: user._id
+                      }
+                }
+              ],
+              as: 'activities'
+            }
+          },
         {
           $project: {
             _id: 1,
@@ -379,26 +403,39 @@ router.get('/analytics', authenticate, async (req, res) => {
         },
         { $sort: { healthScore: -1 } },
         { $limit: 20 }
-      ]),
+        ];
+        return Project.aggregate(pipeline);
+      })(),
       
-      // Top performing projects
-      Project.aggregate([
-        {
-          $lookup: {
-            from: 'projectcontacts',
-            localField: '_id',
-            foreignField: 'projectId',
-            as: 'contacts'
-          }
-        },
-        {
-          $lookup: {
-            from: 'activities',
-            localField: '_id',
-            foreignField: 'projectId',
-            as: 'activities'
-          }
-        },
+      // Top performing projects - filter by user unless admin
+      (() => {
+        const pipeline = [
+          { $match: projectFilter },
+          {
+            $lookup: {
+              from: 'projectcontacts',
+              localField: '_id',
+              foreignField: 'projectId',
+              as: 'contacts'
+            }
+          },
+          {
+            $lookup: {
+              from: 'activities',
+              let: { projectId: '$_id' },
+              pipeline: [
+                {
+                  $match: isAdmin 
+                    ? { $expr: { $eq: ['$projectId', '$$projectId'] } }
+                    : {
+                        $expr: { $eq: ['$projectId', '$$projectId'] },
+                        createdBy: user._id
+                      }
+                }
+              ],
+              as: 'activities'
+            }
+          },
         {
           $project: {
             _id: 1,
@@ -428,7 +465,9 @@ router.get('/analytics', authenticate, async (req, res) => {
         },
         { $sort: { wonCount: -1, meetingCount: -1 } },
         { $limit: 10 }
-      ]),
+        ];
+        return Project.aggregate(pipeline);
+      })(),
       
       // Conversion metrics - only from existing projects
       ProjectContact.aggregate([
@@ -454,11 +493,11 @@ router.get('/analytics', authenticate, async (req, res) => {
         }
       ]),
       
-      // Activity trends (last 7 days)
+      // Activity trends (last 7 days) - filter by user unless admin
       Activity.aggregate([
         {
           $match: {
-            projectId: { $in: projectIds },
+            ...activityFilter,
             createdAt: { $gte: sevenDaysAgo }
           }
         },
@@ -474,9 +513,9 @@ router.get('/analytics', authenticate, async (req, res) => {
         { $sort: { '_id.date': 1 } }
       ]),
       
-      // Recent activities
+      // Recent activities - filter by user unless admin
       Activity.aggregate([
-        { $match: { projectId: { $in: projectIds } } },
+        { $match: activityFilter },
         {
           $lookup: {
             from: 'projects',
@@ -654,6 +693,8 @@ router.get('/analytics', authenticate, async (req, res) => {
 // IMPORTANT: This route must come before /:id to avoid route conflicts
 router.get('/prospect-analytics', authenticate, async (req, res) => {
   try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
     const Activity = require('../models/Activity');
     const { projectId } = req.query;
     const now = new Date();
@@ -663,12 +704,27 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     // Build filter for project-specific or all projects
     let projectFilter = {};
     let projectIds = [];
+    let userProjectFilter = {};
+    
+    if (!isAdmin) {
+      userProjectFilter.createdBy = user._id;
+    }
     
     if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+      // Verify user has access to this project
+      if (!isAdmin) {
+        const project = await Project.findOne({ _id: projectId, createdBy: user._id });
+        if (!project) {
+          return res.status(403).json({
+            success: false,
+            error: 'Access denied to this project'
+          });
+        }
+      }
       projectFilter = { projectId: new mongoose.Types.ObjectId(projectId) };
       projectIds = [new mongoose.Types.ObjectId(projectId)];
     } else {
-      const projects = await Project.find().lean();
+      const projects = await Project.find(userProjectFilter).lean();
       projectIds = projects.map(p => p._id);
       projectFilter = { projectId: { $in: projectIds } };
     }
@@ -1334,7 +1390,15 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
 router.get('/', authenticate, async (req, res) => {
   try {
     const { search, status } = req.query;
-    let filter = {}; // Show all projects created by any user
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    
+    let filter = {};
+    
+    // Filter by user unless admin
+    if (!isAdmin) {
+      filter.createdBy = user._id;
+    }
 
     if (status) {
       filter.status = status;
@@ -1477,6 +1541,8 @@ router.get('/', authenticate, async (req, res) => {
 router.get('/:id', authenticate, async (req, res) => {
   try {
     const projectId = req.params.id;
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
 
     // Validate ObjectId
     if (!mongoose.Types.ObjectId.isValid(projectId)) {
@@ -1486,9 +1552,14 @@ router.get('/:id', authenticate, async (req, res) => {
       });
     }
 
-    const project = await Project.findOne({
-      _id: projectId
-    }).lean();
+    let filter = { _id: projectId };
+    
+    // Filter by user unless admin
+    if (!isAdmin) {
+      filter.createdBy = user._id;
+    }
+
+    const project = await Project.findOne(filter).lean();
 
     if (!project) {
       return res.status(404).json({
@@ -1663,11 +1734,18 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       });
     }
 
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    
     // Use aggregation for better performance with large datasets
     const projectObjectId = new mongoose.Types.ObjectId(projectId);
 
-    // Check if project exists (lightweight check)
-    const projectExists = await Project.exists({ _id: projectObjectId });
+    // Check if project exists and user has access (lightweight check)
+    let projectFilter = { _id: projectObjectId };
+    if (!isAdmin) {
+      projectFilter.createdBy = user._id;
+    }
+    const projectExists = await Project.exists(projectFilter);
     if (!projectExists) {
       return res.status(404).json({
         success: false,

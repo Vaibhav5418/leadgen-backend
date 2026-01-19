@@ -66,7 +66,7 @@ async function checkDuplicate(contactData) {
 }
 
 // Create contact
-router.post('/', async (req, res) => {
+router.post('/', authenticate, async (req, res) => {
   try {
     // Check for duplicates before creating
     const duplicateCheck = await checkDuplicate(req.body);
@@ -78,7 +78,9 @@ router.post('/', async (req, res) => {
       });
     }
     
-    const contact = await Contact.create(req.body);
+    // Set createdBy to current user
+    const contactData = { ...req.body, createdBy: req.user._id };
+    const contact = await Contact.create(contactData);
     res.status(201).json({
       success: true,
       data: contact
@@ -92,8 +94,10 @@ router.post('/', async (req, res) => {
 });
 
 // Get all contacts
-router.get('/', async (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
     const { 
       category, 
       page = 1, 
@@ -115,6 +119,10 @@ router.get('/', async (req, res) => {
     const skip = (pageNum - 1) * limitNum;
     
     let filter = {};
+    // Filter by user unless admin
+    if (!isAdmin) {
+      filter.createdBy = user._id;
+    }
     let categoryFilter = {};
     
     if (category) {

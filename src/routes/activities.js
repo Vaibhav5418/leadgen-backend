@@ -171,8 +171,30 @@ router.post('/', authenticate, async (req, res) => {
 // Get all activities for a project
 router.get('/project/:projectId', authenticate, async (req, res) => {
   try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    const Project = require('../models/Project');
+    
+    // Verify user has access to this project
+    if (!isAdmin) {
+      const project = await Project.findById(req.params.projectId);
+      if (!project || project.createdBy.toString() !== user._id.toString()) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied to this project'
+        });
+      }
+    }
+    
     const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
-    const activities = await Activity.find({ projectId: req.params.projectId })
+    let activityFilter = { projectId: req.params.projectId };
+    
+    // Filter activities by user unless admin
+    if (!isAdmin) {
+      activityFilter.createdBy = user._id;
+    }
+    
+    const activities = await Activity.find(activityFilter)
       .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt lnRequestSent connected linkedInAccountName callNumber callStatus callDate emailDate linkedinDate')
       .sort({ createdAt: -1 })
       .limit(limit)
@@ -194,6 +216,9 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
 // Get all activities for a contact
 router.get('/contact/:contactId', authenticate, async (req, res) => {
   try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    const Project = require('../models/Project');
     const contactObjectId = new mongoose.Types.ObjectId(req.params.contactId);
     const projectId = req.query.projectId; // Get projectId from query parameter (optional)
     
@@ -207,6 +232,17 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
         });
       }
       projectObjectId = new mongoose.Types.ObjectId(projectId);
+      
+      // Verify user has access to this project
+      if (!isAdmin) {
+        const project = await Project.findById(projectId);
+        if (!project || project.createdBy.toString() !== user._id.toString()) {
+          return res.status(403).json({
+            success: false,
+            error: 'Access denied to this project'
+          });
+        }
+      }
     }
     
     // First verify the contact exists in either ProspectContact or Contact (legacy)
@@ -227,6 +263,11 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
     const matchCriteria = { contactId: contactObjectId };
     if (projectObjectId) {
       matchCriteria.projectId = projectObjectId; // Only show activities for this specific project
+    }
+    
+    // Filter by user unless admin
+    if (!isAdmin) {
+      matchCriteria.createdBy = user._id;
     }
     
     // Use aggregation for better performance - lookup from both ProspectContact and Contact collections

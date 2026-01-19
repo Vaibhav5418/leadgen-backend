@@ -22,7 +22,7 @@ router.get('/', authenticate, async (req, res) => {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
-    // Get all projects
+    // Get all projects - all users can see all data in master dashboard
     const allProjects = await Project.find().lean();
     const projectIds = allProjects.map(p => p._id);
 
