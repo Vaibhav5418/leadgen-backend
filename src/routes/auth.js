@@ -177,9 +177,13 @@ router.post('/login', async (req, res) => {
       });
     }
 
+    // Normalize email (lowercase and trim)
+    const normalizedEmail = email.toLowerCase().trim();
+
     // Find user by email
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: normalizedEmail });
     if (!user) {
+      console.log(`Login failed: User not found for email: ${normalizedEmail}`);
       return res.status(401).json({
         success: false,
         error: 'Invalid email or password'
@@ -189,11 +193,14 @@ router.post('/login', async (req, res) => {
     // Check password
     const isPasswordValid = await user.comparePassword(password);
     if (!isPasswordValid) {
+      console.log(`Login failed: Invalid password for email: ${normalizedEmail}`);
       return res.status(401).json({
         success: false,
         error: 'Invalid email or password'
       });
     }
+
+    console.log(`Login successful for: ${normalizedEmail}`);
 
     // Generate JWT token
     const token = jwt.sign(
@@ -230,6 +237,143 @@ router.post('/login', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to login'
+    });
+  }
+});
+
+// Request password reset
+router.post('/request-password-reset', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is required'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide a valid email address'
+      });
+    }
+
+    // Check database connection
+    if (!checkDatabaseConnection()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database connection not available. Please try again later.'
+      });
+    }
+
+    // Find user by email
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    
+    // Always return success to prevent email enumeration
+    // In production, you would send an email with a reset token here
+    if (user) {
+      // TODO: In production, send email with reset token
+      // For now, we'll allow direct password reset
+      console.log(`Password reset requested for: ${email}`);
+    }
+
+    res.json({
+      success: true,
+      message: 'If an account exists with this email, you will receive password reset instructions.'
+    });
+  } catch (error) {
+    console.error('Password reset request error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to process password reset request'
+    });
+  }
+});
+
+// Reset password
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+
+    if (!email || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email is required'
+      });
+    }
+
+    if (!newPassword || !newPassword.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'New password is required'
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 6 characters long'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide a valid email address'
+      });
+    }
+
+    // Check database connection
+    if (!checkDatabaseConnection()) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database connection not available. Please try again later.'
+      });
+    }
+
+    // Find user by email
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Update password - assign directly and save
+    // The pre-save hook will automatically hash it
+    user.password = newPassword.trim();
+    
+    // Save the user - this will trigger the pre-save hook to hash the password
+    await user.save();
+
+    console.log(`Password reset successful for: ${email}`);
+
+    res.json({
+      success: true,
+      message: 'Password has been reset successfully'
+    });
+  } catch (error) {
+    console.error('Password reset error:', error);
+    
+    // Handle validation errors
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json({
+        success: false,
+        error: messages.join(', ')
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to reset password'
     });
   }
 });
