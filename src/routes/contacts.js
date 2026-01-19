@@ -1,7 +1,10 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Contact = require('../models/Contact');
 const ProspectContact = require('../models/ProspectContact');
+const ProjectContact = require('../models/ProjectContact');
+const Project = require('../models/Project');
 const authenticate = require('../middleware/auth');
 
 // Helper function to check for duplicates
@@ -118,6 +121,227 @@ router.get('/', authenticate, async (req, res) => {
     const limitNum = parseInt(limit, 10);
     const skip = (pageNum - 1) * limitNum;
     
+    // Check if category is a project (starts with "Project: ")
+    let isProjectCategory = false;
+    let projectId = null;
+    
+    if (category && category.startsWith('Project: ')) {
+      isProjectCategory = true;
+      const projectName = category.replace('Project: ', '');
+      
+      // Find project by company name
+      let projectFilter = { companyName: projectName };
+      if (!isAdmin) {
+        projectFilter.createdBy = user._id;
+      }
+      
+      const project = await Project.findOne(projectFilter).select('_id').lean();
+      if (project) {
+        projectId = project._id;
+      } else {
+        // Project not found or user doesn't have access
+        return res.json({
+          success: true,
+          count: 0,
+          total: 0,
+          page: pageNum,
+          limit: limitNum,
+          totalPages: 0,
+          data: []
+        });
+      }
+    }
+    
+    // If this is a project category, fetch from ProjectContact
+    if (isProjectCategory && projectId) {
+      try {
+        const projectObjectId = new mongoose.Types.ObjectId(projectId);
+        
+        // Build match filter for project contacts
+        let matchFilter = { projectId: projectObjectId };
+        
+        // Add search filter if provided
+        if (search && search.trim()) {
+          const searchTerm = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          matchFilter.$or = [
+            { 'contact.name': { $regex: searchTerm, $options: 'i' } },
+            { 'contact.email': { $regex: searchTerm, $options: 'i' } },
+            { 'contact.company': { $regex: searchTerm, $options: 'i' } },
+            { 'contact.title': { $regex: searchTerm, $options: 'i' } },
+            { 'contact.firstPhone': { $regex: searchTerm, $options: 'i' } },
+            { 'contact.industry': { $regex: searchTerm, $options: 'i' } },
+            { 'contact.keywords': { $regex: searchTerm, $options: 'i' } }
+          ];
+        }
+        
+        // Build aggregation pipeline
+        const pipeline = [
+          { $match: matchFilter },
+          {
+            $lookup: {
+              from: 'prospectcontacts',
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'contact'
+            }
+          },
+          { $unwind: { path: '$contact', preserveNullAndEmptyArrays: false } },
+          {
+            $project: {
+              _id: '$contact._id',
+              name: '$contact.name',
+              title: '$contact.title',
+              company: '$contact.company',
+              email: '$contact.email',
+              firstPhone: '$contact.firstPhone',
+              category: '$contact.category',
+              industry: '$contact.industry',
+              keywords: '$contact.keywords',
+              city: '$contact.city',
+              state: '$contact.state',
+              country: '$contact.country',
+              companyCity: '$contact.companyCity',
+              companyState: '$contact.companyState',
+              companyCountry: '$contact.companyCountry',
+              personLinkedinUrl: '$contact.personLinkedinUrl',
+              companyLinkedinUrl: '$contact.companyLinkedinUrl',
+              website: '$contact.website'
+            }
+          },
+          { $sort: { name: 1 } }
+        ];
+        
+        // Apply additional filters (similar to regular contacts)
+        // Note: For project contacts, we apply filters after the lookup
+        if (filterKeywords && filterKeywords.trim()) {
+          pipeline.push({
+            $match: {
+              keywords: { $regex: filterKeywords.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' }
+            }
+          });
+        }
+        
+        if (filterCity && filterCity.trim()) {
+          pipeline.push({
+            $match: {
+              $or: [
+                { city: { $regex: filterCity.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                { companyCity: { $regex: filterCity.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        if (filterState && filterState.trim()) {
+          pipeline.push({
+            $match: {
+              $or: [
+                { state: { $regex: filterState.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                { companyState: { $regex: filterState.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        if (filterCountry && filterCountry.trim()) {
+          pipeline.push({
+            $match: {
+              $or: [
+                { country: { $regex: filterCountry.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                { companyCountry: { $regex: filterCountry.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        if (filterHasLinkedIn === 'yes') {
+          pipeline.push({
+            $match: {
+              $or: [
+                { personLinkedinUrl: { $exists: true, $ne: '', $ne: null } },
+                { companyLinkedinUrl: { $exists: true, $ne: '', $ne: null } }
+              ]
+            }
+          });
+        } else if (filterHasLinkedIn === 'no') {
+          pipeline.push({
+            $match: {
+              $and: [
+                { $or: [{ personLinkedinUrl: { $exists: false } }, { personLinkedinUrl: null }, { personLinkedinUrl: '' }] },
+                { $or: [{ companyLinkedinUrl: { $exists: false } }, { companyLinkedinUrl: null }, { companyLinkedinUrl: '' }] }
+              ]
+            }
+          });
+        }
+        
+        if (filterHasEmail === 'yes') {
+          pipeline.push({
+            $match: {
+              email: { $exists: true, $ne: null, $ne: '', $regex: /^[^\s@]+@[^\s@]+\.[^\s@]+/ }
+            }
+          });
+        } else if (filterHasEmail === 'no') {
+          pipeline.push({
+            $match: {
+              $or: [
+                { email: { $exists: false } },
+                { email: null },
+                { email: '' },
+                { email: { $not: { $regex: /^[^\s@]+@[^\s@]+\.[^\s@]+/ } } }
+              ]
+            }
+          });
+        }
+        
+        if (filterHasPhone === 'yes') {
+          pipeline.push({
+            $match: {
+              firstPhone: { $exists: true, $ne: null, $ne: '', $not: { $regex: /^\s*$/ } }
+            }
+          });
+        } else if (filterHasPhone === 'no') {
+          pipeline.push({
+            $match: {
+              $or: [
+                { firstPhone: { $exists: false } },
+                { firstPhone: null },
+                { firstPhone: '' },
+                { firstPhone: { $regex: /^\s*$/ } }
+              ]
+            }
+          });
+        }
+        
+        // Get total count (before pagination)
+        const countPipeline = [...pipeline, { $count: 'total' }];
+        const countResult = await ProjectContact.aggregate(countPipeline);
+        const totalCount = countResult.length > 0 ? countResult[0].total : 0;
+        
+        // Add pagination
+        pipeline.push({ $skip: skip }, { $limit: limitNum });
+        
+        // Execute aggregation
+        const contacts = await ProjectContact.aggregate(pipeline);
+        
+        return res.json({
+          success: true,
+          count: contacts.length,
+          total: totalCount,
+          page: pageNum,
+          limit: limitNum,
+          totalPages: Math.ceil(totalCount / limitNum),
+          data: contacts
+        });
+      } catch (error) {
+        console.error('Error fetching project contacts:', error);
+        return res.status(500).json({
+          success: false,
+          error: error.message
+        });
+      }
+    }
+    
+    // Regular category filtering (existing code)
     let filter = {};
     // Filter by user unless admin
     if (!isAdmin) {
@@ -125,7 +349,7 @@ router.get('/', authenticate, async (req, res) => {
     }
     let categoryFilter = {};
     
-    if (category) {
+    if (category && !isProjectCategory) {
       // Handle category matching for variations like:
       // - "IND-IT & Service" (UI) vs "IND-IT&service" (database)
       // - "Web Design & Development" (UI) vs "Web Development" or "Web Design & Devlopment" (database)
@@ -587,8 +811,11 @@ router.get('/categories', async (req, res) => {
 });
 
 // Get all unique companies with contact counts
-router.get('/companies', async (req, res) => {
+router.get('/companies', authenticate, async (req, res) => {
   try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    
     const { 
       category,
       search,
@@ -601,12 +828,255 @@ router.get('/companies', async (req, res) => {
       filterHasPhone
     } = req.query;
     
+    // Check if category is a project (starts with "Project: ")
+    let isProjectCategory = false;
+    let projectId = null;
+    
+    if (category && category.startsWith('Project: ')) {
+      isProjectCategory = true;
+      const projectName = category.replace('Project: ', '');
+      
+      // Find project by company name
+      let projectFilter = { companyName: projectName };
+      if (!isAdmin) {
+        projectFilter.createdBy = user._id;
+      }
+      
+      const project = await Project.findOne(projectFilter).select('_id').lean();
+      if (project) {
+        projectId = project._id;
+      } else {
+        // Project not found or user doesn't have access
+        return res.json({
+          success: true,
+          data: []
+        });
+      }
+    }
+    
+    // If this is a project category, fetch companies from ProjectContact
+    if (isProjectCategory && projectId) {
+      try {
+        const projectObjectId = new mongoose.Types.ObjectId(projectId);
+        
+        // Build aggregation pipeline for project contacts
+        const pipeline = [
+          { $match: { projectId: projectObjectId } },
+          {
+            $lookup: {
+              from: 'prospectcontacts',
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'contact'
+            }
+          },
+          { $unwind: { path: '$contact', preserveNullAndEmptyArrays: false } },
+          {
+            $project: {
+              name: '$contact.name',
+              title: '$contact.title',
+              company: '$contact.company',
+              email: '$contact.email',
+              firstPhone: '$contact.firstPhone',
+              category: '$contact.category',
+              industry: '$contact.industry',
+              keywords: '$contact.keywords',
+              city: '$contact.city',
+              state: '$contact.state',
+              country: '$contact.country',
+              companyCity: '$contact.companyCity',
+              companyState: '$contact.companyState',
+              companyCountry: '$contact.companyCountry',
+              personLinkedinUrl: '$contact.personLinkedinUrl',
+              companyLinkedinUrl: '$contact.companyLinkedinUrl',
+              website: '$contact.website'
+            }
+          }
+        ];
+        
+        // Add search filter if provided
+        if (search && search.trim()) {
+          const searchTerm = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          pipeline.push({
+            $match: {
+              $or: [
+                { name: { $regex: searchTerm, $options: 'i' } },
+                { email: { $regex: searchTerm, $options: 'i' } },
+                { company: { $regex: searchTerm, $options: 'i' } },
+                { title: { $regex: searchTerm, $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        // Add additional filters
+        if (filterKeywords && filterKeywords.trim()) {
+          pipeline.push({
+            $match: {
+              keywords: { $regex: filterKeywords.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' }
+            }
+          });
+        }
+        
+        if (filterCity && filterCity.trim()) {
+          pipeline.push({
+            $match: {
+              $or: [
+                { city: { $regex: filterCity.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                { companyCity: { $regex: filterCity.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        if (filterState && filterState.trim()) {
+          pipeline.push({
+            $match: {
+              $or: [
+                { state: { $regex: filterState.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                { companyState: { $regex: filterState.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        if (filterCountry && filterCountry.trim()) {
+          pipeline.push({
+            $match: {
+              $or: [
+                { country: { $regex: filterCountry.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+                { companyCountry: { $regex: filterCountry.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+              ]
+            }
+          });
+        }
+        
+        if (filterHasLinkedIn === 'yes') {
+          pipeline.push({
+            $match: {
+              $or: [
+                { personLinkedinUrl: { $exists: true, $ne: '', $ne: null } },
+                { companyLinkedinUrl: { $exists: true, $ne: '', $ne: null } }
+              ]
+            }
+          });
+        } else if (filterHasLinkedIn === 'no') {
+          pipeline.push({
+            $match: {
+              $and: [
+                { $or: [{ personLinkedinUrl: { $exists: false } }, { personLinkedinUrl: null }, { personLinkedinUrl: '' }] },
+                { $or: [{ companyLinkedinUrl: { $exists: false } }, { companyLinkedinUrl: null }, { companyLinkedinUrl: '' }] }
+              ]
+            }
+          });
+        }
+        
+        if (filterHasEmail === 'yes') {
+          pipeline.push({
+            $match: {
+              email: { $exists: true, $ne: null, $ne: '', $regex: /^[^\s@]+@[^\s@]+\.[^\s@]+/ }
+            }
+          });
+        } else if (filterHasEmail === 'no') {
+          pipeline.push({
+            $match: {
+              $or: [
+                { email: { $exists: false } },
+                { email: null },
+                { email: '' },
+                { email: { $not: { $regex: /^[^\s@]+@[^\s@]+\.[^\s@]+/ } } }
+              ]
+            }
+          });
+        }
+        
+        if (filterHasPhone === 'yes') {
+          pipeline.push({
+            $match: {
+              firstPhone: { $exists: true, $ne: null, $ne: '', $not: { $regex: /^\s*$/ } }
+            }
+          });
+        } else if (filterHasPhone === 'no') {
+          pipeline.push({
+            $match: {
+              $or: [
+                { firstPhone: { $exists: false } },
+                { firstPhone: null },
+                { firstPhone: '' },
+                { firstPhone: { $regex: /^\s*$/ } }
+              ]
+            }
+          });
+        }
+        
+        // Filter out contacts without company names
+        pipeline.push({
+          $match: {
+            company: { $exists: true, $ne: null, $ne: '' }
+          }
+        });
+        
+        // Group by company name and count
+        pipeline.push({
+          $group: {
+            _id: '$company',
+            count: { $sum: 1 }
+          }
+        });
+        
+        // Project final result
+        pipeline.push({
+          $project: {
+            name: { $trim: { input: '$_id' } },
+            count: 1,
+            _id: 0
+          }
+        });
+        
+        // Filter out empty company names
+        pipeline.push({
+          $match: {
+            name: { $ne: '' }
+          }
+        });
+        
+        // Sort by company name
+        pipeline.push({ $sort: { name: 1 } });
+        
+        // Execute aggregation
+        const companiesWithCounts = await ProjectContact.aggregate(pipeline);
+        
+        // Format results
+        const uniqueCompanies = companiesWithCounts.map(item => ({
+          name: item.name,
+          count: item.count
+        }));
+        
+        return res.json({
+          success: true,
+          data: uniqueCompanies
+        });
+      } catch (error) {
+        console.error('Error fetching project companies:', error);
+        return res.status(500).json({
+          success: false,
+          error: error.message
+        });
+      }
+    }
+    
+    // Regular category filtering (existing code)
     // Build filter for category if provided
     let filter = { 
       company: { $exists: true, $ne: '', $ne: null } 
     };
     
-    if (category && category !== 'All') {
+    // Filter by user unless admin
+    if (!isAdmin) {
+      filter.createdBy = user._id;
+    }
+    
+    if (category && category !== 'All' && !isProjectCategory) {
       // Use the same category matching logic as the main contacts route
       const getKeyWords = (cat) => {
         const words = cat

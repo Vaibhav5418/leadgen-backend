@@ -1,10 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const Category = require('../models/Category');
+const Project = require('../models/Project');
+const authenticate = require('../middleware/auth');
 
-// Get all categories
-router.get('/', async (req, res) => {
+// Get all categories (including projects)
+router.get('/', authenticate, async (req, res) => {
   try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    
     // Check if any categories exist, if not, sync from contacts
     const categoryCount = await Category.countDocuments({ isActive: true });
     
@@ -36,14 +41,40 @@ router.get('/', async (req, res) => {
       }
     }
     
+    // Get regular categories
     const categories = await Category.find({ isActive: true })
       .select('name description')
       .sort({ name: 1 })
       .lean();
     
+    // Get projects (filter by user unless admin)
+    let projectFilter = {};
+    if (!isAdmin) {
+      projectFilter.createdBy = user._id;
+    }
+    
+    const projects = await Project.find(projectFilter)
+      .select('_id companyName status')
+      .sort({ createdAt: -1 })
+      .lean();
+    
+    // Format project names with prefix to distinguish from regular categories
+    const projectCategories = projects.map(project => ({
+      name: `Project: ${project.companyName}`,
+      projectId: project._id.toString(),
+      isProject: true
+    }));
+    
+    // Combine regular categories and project categories
+    const allCategories = [
+      ...categories.map(cat => ({ name: cat.name, isProject: false })),
+      ...projectCategories
+    ];
+    
     res.json({
       success: true,
-      data: categories.map(cat => cat.name)
+      data: allCategories.map(cat => cat.name),
+      projects: projectCategories // Include project metadata for frontend
     });
   } catch (error) {
     console.error('Error fetching categories:', error);
