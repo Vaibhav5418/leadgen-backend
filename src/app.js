@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const mongoose = require('mongoose');
 const compression = require('compression');
+const { connectDB } = require('./db/connection');
 
 const app = express();
 
@@ -45,46 +45,15 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// MongoDB Atlas Connection
-const MONGODB_URI = process.env.MONGODB_URI;
+// Lightweight health check endpoint (for Render uptime pings)
+// Returns immediately without checking database
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
 
-// Connection options to handle reconnection and prevent ECONNRESET errors
-const mongooseOptions = {
-  serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
-  socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
-  connectTimeoutMS: 10000, // Give up initial connection after 10s
-  maxPoolSize: 10, // Maintain up to 10 socket connections
-  minPoolSize: 2, // Maintain at least 2 socket connections
-  maxIdleTimeMS: 30000, // Close connections after 30s of inactivity
-  retryWrites: true, // Retry write operations on network errors
-  retryReads: true, // Retry read operations on network errors
-};
-
-mongoose.connect(MONGODB_URI, mongooseOptions)
-  .then(() => {
-    console.log('✅ MongoDB Atlas connected successfully');
-    
-    // Handle connection events
-    mongoose.connection.on('error', (err) => {
-      console.error('❌ MongoDB connection error:', err.message);
-    });
-    
-    mongoose.connection.on('disconnected', () => {
-      console.warn('⚠️ MongoDB disconnected. Attempting to reconnect...');
-    });
-    
-    mongoose.connection.on('reconnected', () => {
-      console.log('✅ MongoDB reconnected successfully');
-    });
-    
-    mongoose.connection.on('close', () => {
-      console.warn('⚠️ MongoDB connection closed');
-    });
-  })
-  .catch((err) => {
-    console.error('❌ MongoDB connection error:', err.message);
-    console.log('💡 Make sure to set MONGODB_URI in your .env file');
-  });
+// MongoDB connection - start in background (non-blocking)
+// Server will start even if DB connection is still establishing
+connectDB();
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
@@ -98,11 +67,12 @@ app.use('/api/categories', require('./routes/categories'));
 app.use('/api/projects', require('./routes/projects'));
 app.use('/api/activities', require('./routes/activities'));
 
-// Health check
+// Detailed health check endpoint (includes database status)
 app.get('/api/health', (req, res) => {
+  const { isDBConnected } = require('./db/connection');
   res.json({ 
     status: 'OK',
-    database: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'
+    database: isDBConnected() ? 'Connected' : 'Disconnected'
   });
 });
 
