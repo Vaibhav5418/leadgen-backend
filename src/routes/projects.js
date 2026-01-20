@@ -1348,6 +1348,24 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       }
     });
 
+    // Calculate call status breakdown for the donut chart (count all activities by status)
+    // Count all call activities regardless of deduplication to show true status distribution
+    const callStatusBreakdown = {};
+    if (callFunnel && callFunnel.length > 0) {
+      callFunnel.forEach(c => {
+        // Count all call activities, not just those from deduplicated contacts
+        // Handle null, undefined, or empty string callStatus
+        let status = 'No Status';
+        if (c.callStatus && typeof c.callStatus === 'string' && c.callStatus.trim() !== '') {
+          status = c.callStatus.trim();
+        }
+        if (!callStatusBreakdown[status]) {
+          callStatusBreakdown[status] = 0;
+        }
+        callStatusBreakdown[status]++;
+      });
+    }
+
     const callFunnelData = {
       prospectData: totalProspects,
       // New 10-stage structure - counts unique contacts that have EVER reached each stage
@@ -1360,6 +1378,8 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       demoCompleted: demoCompletedSet.size,
       sql: sqlSet.size,
       won: wonSet.size,
+      // Call status breakdown for donut chart
+      callStatusBreakdown: callStatusBreakdown,
       // Legacy fields for backward compatibility
       callSent: callsAttemptedSet.size,
       accepted: callsConnectedSet.size,
