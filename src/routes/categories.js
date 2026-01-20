@@ -47,10 +47,13 @@ router.get('/', authenticate, async (req, res) => {
       .sort({ name: 1 })
       .lean();
     
-    // Get projects (filter by user unless admin)
+    // Get projects (filter by user unless admin - include projects where user is creator OR team member)
     let projectFilter = {};
     if (!isAdmin) {
-      projectFilter.createdBy = user._id;
+      projectFilter.$or = [
+        { createdBy: user._id },
+        { teamMembers: { $in: [user.email.toLowerCase()] } }
+      ];
     }
     
     const projects = await Project.find(projectFilter)

@@ -129,10 +129,13 @@ router.get('/', authenticate, async (req, res) => {
       isProjectCategory = true;
       const projectName = category.replace('Project: ', '');
       
-      // Find project by company name
+      // Find project by company name - include projects where user is creator OR team member
       let projectFilter = { companyName: projectName };
       if (!isAdmin) {
-        projectFilter.createdBy = user._id;
+        projectFilter.$or = [
+          { companyName: projectName, createdBy: user._id },
+          { companyName: projectName, teamMembers: { $in: [user.email.toLowerCase()] } }
+        ];
       }
       
       const project = await Project.findOne(projectFilter).select('_id').lean();
@@ -836,10 +839,13 @@ router.get('/companies', authenticate, async (req, res) => {
       isProjectCategory = true;
       const projectName = category.replace('Project: ', '');
       
-      // Find project by company name
+      // Find project by company name - include projects where user is creator OR team member
       let projectFilter = { companyName: projectName };
       if (!isAdmin) {
-        projectFilter.createdBy = user._id;
+        projectFilter.$or = [
+          { companyName: projectName, createdBy: user._id },
+          { companyName: projectName, teamMembers: { $in: [user.email.toLowerCase()] } }
+        ];
       }
       
       const project = await Project.findOne(projectFilter).select('_id').lean();

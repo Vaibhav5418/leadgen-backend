@@ -44,6 +44,29 @@ router.post('/', authenticate, async (req, res) => {
       });
     }
 
+    // Verify user has access to this project (creator or team member)
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    if (!isAdmin) {
+      const Project = require('../models/Project');
+      const project = await Project.findById(projectId);
+      if (!project) {
+        return res.status(404).json({
+          success: false,
+          error: 'Project not found'
+        });
+      }
+      const isCreator = project.createdBy.toString() === user._id.toString();
+      const isTeamMember = project.teamMembers && 
+        project.teamMembers.some(email => email.toLowerCase() === user.email.toLowerCase());
+      if (!isCreator && !isTeamMember) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied to this project'
+        });
+      }
+    }
+
     // Status is now optional for all activity types (Email, LinkedIn, and Call)
     // Conversation Notes is now optional - no minimum length validation
 
@@ -99,16 +122,33 @@ router.post('/', authenticate, async (req, res) => {
     await activity.save();
 
     // Update ProjectContact stage based on the most recent activity status
-    // Only update if the current activity has a status, or if we need to find the latest status
+    // Create ProjectContact entry if it doesn't exist to prevent duplicates
     if (contactId && projectId) {
       try {
+        // Check if ProjectContact entry exists
+        const existingProjectContact = await ProjectContact.findOne({
+          projectId: projectId,
+          contactId: contactId
+        });
+
         // If the current activity has a status, use it to update the stage
         if (status) {
-          await ProjectContact.findOneAndUpdate(
-            { projectId: projectId, contactId: contactId },
-            { stage: status },
-            { upsert: false } // Don't create if it doesn't exist
-          );
+          if (existingProjectContact) {
+            // Update existing entry
+            await ProjectContact.findOneAndUpdate(
+              { projectId: projectId, contactId: contactId },
+              { stage: status }
+            );
+          } else {
+            // Create new ProjectContact entry
+            await ProjectContact.create({
+              projectId: projectId,
+              contactId: contactId,
+              stage: status,
+              assignedTo: '',
+              priority: 'Medium'
+            });
+          }
         } else {
           // If current activity doesn't have a status, find the most recent activity with a status
           const mostRecentActivity = await Activity.findOne({
@@ -119,20 +159,30 @@ router.post('/', authenticate, async (req, res) => {
             .sort({ createdAt: -1 })
             .lean();
 
-          if (mostRecentActivity && mostRecentActivity.status) {
-            // Update ProjectContact stage to match the most recent activity status
-            await ProjectContact.findOneAndUpdate(
-              { projectId: projectId, contactId: contactId },
-              { stage: mostRecentActivity.status },
-              { upsert: false } // Don't create if it doesn't exist
-            );
+          if (existingProjectContact) {
+            // Update existing entry
+            if (mostRecentActivity && mostRecentActivity.status) {
+              await ProjectContact.findOneAndUpdate(
+                { projectId: projectId, contactId: contactId },
+                { stage: mostRecentActivity.status }
+              );
+            } else {
+              // If no activity with status exists, set stage to 'New'
+              await ProjectContact.findOneAndUpdate(
+                { projectId: projectId, contactId: contactId },
+                { stage: 'New' }
+              );
+            }
           } else {
-            // If no activity with status exists, set stage to 'New'
-            await ProjectContact.findOneAndUpdate(
-              { projectId: projectId, contactId: contactId },
-              { stage: 'New' },
-              { upsert: false } // Don't create if it doesn't exist
-            );
+            // Create new ProjectContact entry
+            const stageToSet = (mostRecentActivity && mostRecentActivity.status) ? mostRecentActivity.status : 'New';
+            await ProjectContact.create({
+              projectId: projectId,
+              contactId: contactId,
+              stage: stageToSet,
+              assignedTo: '',
+              priority: 'Medium'
+            });
           }
         }
       } catch (updateError) {
@@ -175,10 +225,19 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
     const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
     const Project = require('../models/Project');
     
-    // Verify user has access to this project
+    // Verify user has access to this project (creator or team member)
     if (!isAdmin) {
       const project = await Project.findById(req.params.projectId);
-      if (!project || project.createdBy.toString() !== user._id.toString()) {
+      if (!project) {
+        return res.status(404).json({
+          success: false,
+          error: 'Project not found'
+        });
+      }
+      const isCreator = project.createdBy.toString() === user._id.toString();
+      const isTeamMember = project.teamMembers && 
+        project.teamMembers.some(email => email.toLowerCase() === user.email.toLowerCase());
+      if (!isCreator && !isTeamMember) {
         return res.status(403).json({
           success: false,
           error: 'Access denied to this project'
@@ -189,9 +248,19 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
     const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
     let activityFilter = { projectId: req.params.projectId };
     
-    // Filter activities by user unless admin
+    // For team members, show all activities in the project
+    // For creators, show all activities in their projects
+    // For non-team members, only show their own activities
     if (!isAdmin) {
+      const project = await Project.findById(req.params.projectId).lean();
+      const isTeamMember = project.teamMembers && 
+        project.teamMembers.some(email => email.toLowerCase() === user.email.toLowerCase());
+      const isCreator = project.createdBy.toString() === user._id.toString();
+      
+      // Team members and creators can see all activities in the project
+      if (!isTeamMember && !isCreator) {
       activityFilter.createdBy = user._id;
+      }
     }
     
     const activities = await Activity.find(activityFilter)
@@ -233,10 +302,19 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
       }
       projectObjectId = new mongoose.Types.ObjectId(projectId);
       
-      // Verify user has access to this project
+      // Verify user has access to this project (creator or team member)
       if (!isAdmin) {
         const project = await Project.findById(projectId);
-        if (!project || project.createdBy.toString() !== user._id.toString()) {
+        if (!project) {
+          return res.status(404).json({
+            success: false,
+            error: 'Project not found'
+          });
+        }
+        const isCreator = project.createdBy.toString() === user._id.toString();
+        const isTeamMember = project.teamMembers && 
+          project.teamMembers.some(email => email.toLowerCase() === user.email.toLowerCase());
+        if (!isCreator && !isTeamMember) {
           return res.status(403).json({
             success: false,
             error: 'Access denied to this project'
@@ -366,6 +444,244 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
   }
 });
 
+// Get team performance activity data
+router.get('/team-performance', authenticate, async (req, res) => {
+  try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    const { projectId, timeFilter } = req.query;
+    const Project = require('../models/Project');
+    
+    // Calculate date range based on time filter
+    const now = new Date();
+    let startDate;
+    
+    switch (timeFilter) {
+      case 'today':
+        startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        break;
+      case 'last7days':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case 'lastMonth':
+        startDate = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate());
+        break;
+      default:
+        startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    }
+    
+    // Build project filter - include projects where user is creator OR team member
+    let projectFilter = {};
+    if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+      if (!isAdmin) {
+        const project = await Project.findOne({
+          _id: projectId,
+          $or: [
+            { createdBy: user._id },
+            { teamMembers: { $in: [user.email.toLowerCase()] } }
+          ]
+        });
+        if (!project) {
+          return res.status(403).json({
+            success: false,
+            error: 'Access denied to this project'
+          });
+        }
+      }
+      projectFilter.projectId = new mongoose.Types.ObjectId(projectId);
+    } else if (!isAdmin) {
+      const projects = await Project.find({
+        $or: [
+          { createdBy: user._id },
+          { teamMembers: { $in: [user.email.toLowerCase()] } }
+        ]
+      }).lean();
+      const projectIds = projects.map(p => p._id);
+      projectFilter.projectId = { $in: projectIds };
+    }
+    
+    // Build date filter - use activity-specific dates
+    const dateFilter = {
+      $or: [
+        { callDate: { $gte: startDate, $lte: now } },
+        { emailDate: { $gte: startDate, $lte: now } },
+        { linkedinDate: { $gte: startDate, $lte: now } },
+        { 
+          $and: [
+            { callDate: { $exists: false } },
+            { emailDate: { $exists: false } },
+            { linkedinDate: { $exists: false } },
+            { createdAt: { $gte: startDate, $lte: now } }
+          ]
+        }
+      ]
+    };
+    
+    // Fetch activities
+    const activities = await Activity.find({
+      ...projectFilter,
+      ...dateFilter
+    }).lean();
+    
+    // Process activities for chart data
+    const chartLabels = [];
+    const callData = [];
+    const emailData = [];
+    const linkedinData = [];
+    
+    // Group by date
+    const activitiesByDate = {};
+    activities.forEach(activity => {
+      let activityDate;
+      if (activity.type === 'call' && activity.callDate) {
+        activityDate = new Date(activity.callDate).toISOString().split('T')[0];
+      } else if (activity.type === 'email' && activity.emailDate) {
+        activityDate = new Date(activity.emailDate).toISOString().split('T')[0];
+      } else if (activity.type === 'linkedin' && activity.linkedinDate) {
+        activityDate = new Date(activity.linkedinDate).toISOString().split('T')[0];
+      } else {
+        activityDate = new Date(activity.createdAt).toISOString().split('T')[0];
+      }
+      
+      if (!activitiesByDate[activityDate]) {
+        activitiesByDate[activityDate] = { call: 0, email: 0, linkedin: 0 };
+      }
+      
+      if (activity.type === 'call') {
+        activitiesByDate[activityDate].call++;
+      } else if (activity.type === 'email') {
+        activitiesByDate[activityDate].email++;
+      } else if (activity.type === 'linkedin') {
+        activitiesByDate[activityDate].linkedin++;
+      }
+    });
+    
+    // Sort dates and build chart data
+    const sortedDates = Object.keys(activitiesByDate).sort();
+    sortedDates.forEach(date => {
+      const dateObj = new Date(date);
+      chartLabels.push(dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
+      callData.push(activitiesByDate[date].call);
+      emailData.push(activitiesByDate[date].email);
+      linkedinData.push(activitiesByDate[date].linkedin);
+    });
+    
+    // Build status-based breakdown
+    const callStatuses = {};
+    const emailStatuses = {};
+    const linkedinStatuses = {};
+    
+    activities.forEach(activity => {
+      if (activity.type === 'call') {
+        const status = activity.callStatus || 'No Status';
+        callStatuses[status] = (callStatuses[status] || 0) + 1;
+      } else if (activity.type === 'email') {
+        const status = activity.status || 'No Status';
+        emailStatuses[status] = (emailStatuses[status] || 0) + 1;
+      } else if (activity.type === 'linkedin') {
+        const status = activity.status || (activity.connected ? 'Connected' : 'No Status');
+        linkedinStatuses[status] = (linkedinStatuses[status] || 0) + 1;
+      }
+    });
+    
+    // Build pie chart data with status breakdown
+    const pieLabels = [];
+    const pieData = [];
+    const pieColors = [];
+    const colorMap = {
+      'Interested': 'rgba(34, 197, 94, 0.6)',
+      'Ring': 'rgba(59, 130, 246, 0.6)',
+      'Busy': 'rgba(251, 191, 36, 0.6)',
+      'Call Back': 'rgba(249, 115, 22, 0.6)',
+      'Hang Up': 'rgba(239, 68, 68, 0.6)',
+      'Switch Off': 'rgba(107, 114, 128, 0.6)',
+      'Invalid': 'rgba(156, 163, 175, 0.6)',
+      'Future': 'rgba(168, 85, 247, 0.6)',
+      'Details Shared': 'rgba(34, 197, 94, 0.6)',
+      'Demo Booked': 'rgba(59, 130, 246, 0.6)',
+      'Demo Completed': 'rgba(34, 197, 94, 0.6)',
+      'Opened': 'rgba(34, 197, 94, 0.6)',
+      'Replied': 'rgba(59, 130, 246, 0.6)',
+      'No Reply': 'rgba(239, 68, 68, 0.6)',
+      'Meeting Proposed': 'rgba(168, 85, 247, 0.6)',
+      'Meeting Scheduled': 'rgba(59, 130, 246, 0.6)',
+      'Meeting Completed': 'rgba(34, 197, 94, 0.6)',
+      'Connected': 'rgba(34, 197, 94, 0.6)',
+      'No Status': 'rgba(156, 163, 175, 0.6)'
+    };
+    
+    // Add call statuses
+    Object.entries(callStatuses).forEach(([status, count]) => {
+      pieLabels.push(`Call: ${status}`);
+      pieData.push(count);
+      pieColors.push(colorMap[status] || 'rgba(156, 163, 175, 0.6)');
+    });
+    
+    // Add email statuses
+    Object.entries(emailStatuses).forEach(([status, count]) => {
+      pieLabels.push(`Email: ${status}`);
+      pieData.push(count);
+      pieColors.push(colorMap[status] || 'rgba(156, 163, 175, 0.6)');
+    });
+    
+    // Add LinkedIn statuses
+    Object.entries(linkedinStatuses).forEach(([status, count]) => {
+      pieLabels.push(`LinkedIn: ${status}`);
+      pieData.push(count);
+      pieColors.push(colorMap[status] || 'rgba(156, 163, 175, 0.6)');
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        chartData: {
+          labels: chartLabels,
+          datasets: [
+            {
+              label: 'Calls',
+              data: callData,
+              backgroundColor: 'rgba(34, 197, 94, 0.6)',
+              borderColor: 'rgba(34, 197, 94, 1)',
+              borderWidth: 1
+            },
+            {
+              label: 'Emails',
+              data: emailData,
+              backgroundColor: 'rgba(59, 130, 246, 0.6)',
+              borderColor: 'rgba(59, 130, 246, 1)',
+              borderWidth: 1
+            },
+            {
+              label: 'LinkedIn',
+              data: linkedinData,
+              backgroundColor: 'rgba(139, 92, 246, 0.6)',
+              borderColor: 'rgba(139, 92, 246, 1)',
+              borderWidth: 1
+            }
+          ]
+        },
+        pieData: {
+          labels: pieLabels,
+          datasets: [
+            {
+              data: pieData,
+              backgroundColor: pieColors,
+              borderColor: pieColors.map(c => c.replace('0.6', '1')),
+              borderWidth: 1
+            }
+          ]
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching team performance activity data:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch team performance activity data'
+    });
+  }
+});
+
 // Get a single activity
 router.get('/:id', authenticate, async (req, res) => {
   try {
@@ -459,16 +775,33 @@ router.put('/:id', authenticate, async (req, res) => {
     await activity.save();
 
     // Update ProjectContact stage based on the most recent activity status
+    // Create ProjectContact entry if it doesn't exist to prevent duplicates
     if (activity.contactId && activity.projectId) {
       try {
+        // Check if ProjectContact entry exists
+        const existingProjectContact = await ProjectContact.findOne({
+          projectId: activity.projectId,
+          contactId: activity.contactId
+        });
+
         // If the updated activity has a status, use it to update the stage
         if (status !== undefined && status !== null) {
-          // Update to the new status
-          await ProjectContact.findOneAndUpdate(
-            { projectId: activity.projectId, contactId: activity.contactId },
-            { stage: status },
-            { upsert: false } // Don't create if it doesn't exist
-          );
+          if (existingProjectContact) {
+            // Update existing entry
+            await ProjectContact.findOneAndUpdate(
+              { projectId: activity.projectId, contactId: activity.contactId },
+              { stage: status }
+            );
+          } else {
+            // Create new ProjectContact entry
+            await ProjectContact.create({
+              projectId: activity.projectId,
+              contactId: activity.contactId,
+              stage: status,
+              assignedTo: '',
+              priority: 'Medium'
+            });
+          }
         } else {
           // If status wasn't changed or was cleared, find the most recent activity with a status
           const mostRecentActivity = await Activity.findOne({
@@ -479,20 +812,30 @@ router.put('/:id', authenticate, async (req, res) => {
             .sort({ createdAt: -1 })
             .lean();
 
-          if (mostRecentActivity && mostRecentActivity.status) {
-            // Update ProjectContact stage to match the most recent activity status
-            await ProjectContact.findOneAndUpdate(
-              { projectId: activity.projectId, contactId: activity.contactId },
-              { stage: mostRecentActivity.status },
-              { upsert: false } // Don't create if it doesn't exist
-            );
+          if (existingProjectContact) {
+            // Update existing entry
+            if (mostRecentActivity && mostRecentActivity.status) {
+              await ProjectContact.findOneAndUpdate(
+                { projectId: activity.projectId, contactId: activity.contactId },
+                { stage: mostRecentActivity.status }
+              );
+            } else {
+              // If no activity with status exists, set stage to 'New'
+              await ProjectContact.findOneAndUpdate(
+                { projectId: activity.projectId, contactId: activity.contactId },
+                { stage: 'New' }
+              );
+            }
           } else {
-            // If no activity with status exists, set stage to 'New'
-            await ProjectContact.findOneAndUpdate(
-              { projectId: activity.projectId, contactId: activity.contactId },
-              { stage: 'New' },
-              { upsert: false } // Don't create if it doesn't exist
-            );
+            // Create new ProjectContact entry
+            const stageToSet = (mostRecentActivity && mostRecentActivity.status) ? mostRecentActivity.status : 'New';
+            await ProjectContact.create({
+              projectId: activity.projectId,
+              contactId: activity.contactId,
+              stage: stageToSet,
+              assignedTo: '',
+              priority: 'Medium'
+            });
           }
         }
       } catch (updateError) {

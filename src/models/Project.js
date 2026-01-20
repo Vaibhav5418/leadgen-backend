@@ -160,11 +160,9 @@ const projectSchema = new mongoose.Schema({
     default: '',
     trim: true
   },
-  teamAllocation: {
-    note: {
-      type: String,
-      default: 'Team assignments can be configured after project creation'
-    }
+  teamMembers: {
+    type: [String], // Array of email addresses
+    default: []
   },
 
   // Metadata

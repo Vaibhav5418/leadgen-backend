@@ -487,9 +487,22 @@ router.get('/', authenticate, async (req, res) => {
           }
         },
         {
+          $lookup: {
+            from: 'projects',
+            localField: 'projectId',
+            foreignField: '_id',
+            as: 'project'
+          }
+        },
+        {
+          $unwind: { path: '$project', preserveNullAndEmptyArrays: true }
+        },
+        {
           $project: {
             nextActionDate: 1,
             createdAt: 1,
+            projectId: 1,
+            projectName: '$project.companyName',
             hasFollowUp: { $gt: [{ $size: '$followUpActivity' }, 0] },
             isOverdue: { $lt: ['$nextActionDate', new Date()] },
             daysOverdue: {
@@ -498,7 +511,8 @@ router.get('/', authenticate, async (req, res) => {
                 { $divide: [{ $subtract: [new Date(), '$nextActionDate'] }, 86400000] },
                 0
               ]
-            }
+            },
+            actionDate: { $dateToString: { format: '%Y-%m-%d', date: '$nextActionDate' } }
           }
         },
         {
@@ -518,6 +532,20 @@ router.get('/', authenticate, async (req, res) => {
             overdueCount: {
               $sum: {
                 $cond: [{ $and: ['$isOverdue', { $not: '$hasFollowUp' }] }, 1, 0]
+              }
+            },
+            byDate: {
+              $push: {
+                date: '$actionDate',
+                hasFollowUp: '$hasFollowUp',
+                isOverdue: '$isOverdue'
+              }
+            },
+            byProject: {
+              $push: {
+                projectName: '$projectName',
+                hasFollowUp: '$hasFollowUp',
+                isOverdue: '$isOverdue'
               }
             }
           }
@@ -931,7 +959,46 @@ router.get('/', authenticate, async (req, res) => {
           completed: followUpsCompleted,
           overdueCount,
           completionRate: totalDue > 0 ? parseFloat(((followUpsCompleted / totalDue) * 100).toFixed(2)) : 100,
-          slaCompliance: parseFloat(slaCompliance.toFixed(2))
+          slaCompliance: parseFloat(slaCompliance.toFixed(2)),
+          chartData: followUpMetrics[0]?.byDate ? (() => {
+            const byDate = followUpMetrics[0].byDate;
+            const dateMap = {};
+            byDate.forEach(item => {
+              if (!dateMap[item.date]) {
+                dateMap[item.date] = { total: 0, completed: 0, overdue: 0 };
+              }
+              dateMap[item.date].total++;
+              if (item.hasFollowUp) dateMap[item.date].completed++;
+              if (item.isOverdue && !item.hasFollowUp) dateMap[item.date].overdue++;
+            });
+            const sortedDates = Object.keys(dateMap).sort();
+            return {
+              labels: sortedDates,
+              total: sortedDates.map(d => dateMap[d].total),
+              completed: sortedDates.map(d => dateMap[d].completed),
+              overdue: sortedDates.map(d => dateMap[d].overdue)
+            };
+          })() : null,
+          projectData: followUpMetrics[0]?.byProject ? (() => {
+            const byProject = followUpMetrics[0].byProject;
+            const projectMap = {};
+            byProject.forEach(item => {
+              const projectName = item.projectName || 'Unknown';
+              if (!projectMap[projectName]) {
+                projectMap[projectName] = { total: 0, completed: 0, overdue: 0 };
+              }
+              projectMap[projectName].total++;
+              if (item.hasFollowUp) projectMap[projectName].completed++;
+              if (item.isOverdue && !item.hasFollowUp) projectMap[projectName].overdue++;
+            });
+            const sortedProjects = Object.keys(projectMap).sort((a, b) => projectMap[b].total - projectMap[a].total).slice(0, 10);
+            return {
+              labels: sortedProjects,
+              total: sortedProjects.map(p => projectMap[p].total),
+              completed: sortedProjects.map(p => projectMap[p].completed),
+              overdue: sortedProjects.map(p => projectMap[p].overdue)
+            };
+          })() : null
         }
       }
     });

@@ -10,6 +10,7 @@ const Contact = require('../models/Contact');
 const ProspectContact = require('../models/ProspectContact');
 const ProjectContact = require('../models/ProjectContact');
 const Activity = require('../models/Activity');
+const User = require('../models/User');
 const authenticate = require('../middleware/auth');
 
 // Get the actual MongoDB collection name for ProspectContact
@@ -59,7 +60,7 @@ router.post('/', authenticate, async (req, res) => {
       channels,
       icpDefinition,
       assignedTo,
-      teamAllocation
+      teamMembers
     } = req.body;
 
     // Validate required fields
@@ -116,7 +117,7 @@ router.post('/', authenticate, async (req, res) => {
       channels: channels || {},
       icpDefinition: processedIcp,
       assignedTo: assignedTo || '',
-      teamAllocation: teamAllocation || {},
+      teamMembers: Array.isArray(teamMembers) ? teamMembers.filter(email => email && email.trim()) : [],
       createdBy: req.user._id,
       status: 'draft'
     });
@@ -202,17 +203,37 @@ router.get('/analytics', authenticate, async (req, res) => {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     
     // Get projects filtered by user unless admin (for Project Management page)
+    // Include projects where user is creator OR team member
     let projectFilter = {};
     if (!isAdmin) {
-      projectFilter.createdBy = user._id;
+      projectFilter.$or = [
+        { createdBy: user._id },
+        { teamMembers: { $in: [user.email.toLowerCase()] } }
+      ];
     }
     const projects = await Project.find(projectFilter).lean();
     const projectIds = projects.map(p => p._id);
     
-    // Build activity filter - filter by user unless admin
+    // Build activity filter - include activities from team member projects
+    // For team members, show all activities in their assigned projects
     const activityFilter = { projectId: { $in: projectIds } };
     if (!isAdmin) {
+      // Get projects where user is team member
+      const teamMemberProjects = projects.filter(p => 
+        p.teamMembers && p.teamMembers.includes(user.email.toLowerCase())
+      ).map(p => p._id);
+      
+      // If user has team member projects, show all activities in those projects
+      // Otherwise, only show activities created by the user
+      if (teamMemberProjects.length > 0) {
+        // Show all activities in team member projects OR activities created by user in their own projects
+        activityFilter.$or = [
+          { projectId: { $in: teamMemberProjects } },
+          { createdBy: user._id, projectId: { $in: projectIds } }
+        ];
+      } else {
       activityFilter.createdBy = user._id;
+      }
     }
     
     // Parallel queries for performance
@@ -865,24 +886,29 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         { $sort: { count: -1 } }
       ]),
       
-      // Cold Calling Funnel
+      // Cold Calling Funnel - Get all call activities (not just latest) to count contacts that have EVER reached each stage
       Activity.aggregate([
         {
           $match: {
             ...projectFilter,
-            type: 'call'
+            type: 'call',
+            contactId: { $ne: null, $exists: true }
           }
         },
         {
-          $group: {
-            _id: '$contactId',
-            callDate: { $max: '$callDate' },
-            callStatus: { $last: '$callStatus' },
-            callNumber: { $max: '$callNumber' },
-            nextAction: { $last: '$nextAction' },
-            nextActionDate: { $max: '$nextActionDate' },
-            conversationNotes: { $last: '$conversationNotes' }
+          $project: {
+            contactId: 1,
+            callDate: 1,
+            callStatus: 1,
+            callNumber: 1,
+            nextAction: 1,
+            nextActionDate: 1,
+            conversationNotes: 1,
+            createdAt: 1
           }
+        },
+        {
+          $sort: { createdAt: -1 }
         }
       ]),
       
@@ -1088,63 +1114,243 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     const sqlSet = new Set();
     const wonSet = new Set();
 
-    callFunnel.forEach(c => {
-      const contactId = c._id?.toString();
-      if (!contactId) return;
+    // Get all unique contacts for this project (after deduplication) to ensure counts match what users see
+    // This is the same logic as in the KPI endpoint
+    const allProjectContactsForFunnel = await ProjectContact.find({ ...projectFilter })
+      .populate('contactId', 'name email company')
+      .lean();
+    
+    const activityContactIdsForFunnel = await Activity.distinct('contactId', {
+      ...projectFilter,
+      contactId: { $ne: null, $exists: true }
+    });
+    
+    const existingContactIdsForFunnel = new Set(
+      allProjectContactsForFunnel
+        .map(pc => pc.contactId?._id?.toString())
+        .filter(Boolean)
+    );
+    
+    const missingContactIdsForFunnel = activityContactIdsForFunnel.filter(
+      contactId => contactId && !existingContactIdsForFunnel.has(contactId.toString())
+    );
+    
+    let activityBasedContactsForFunnel = [];
+    if (missingContactIdsForFunnel.length > 0) {
+      const missingObjectIds = missingContactIdsForFunnel
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id));
+      
+      const prospectContacts = await ProspectContact.find({ _id: { $in: missingObjectIds } }).lean();
+      const foundIds = new Set(prospectContacts.map(c => c._id.toString()));
+      const remainingIds = missingObjectIds.filter(id => !foundIds.has(id.toString()));
+      
+      let legacyContacts = [];
+      if (remainingIds.length > 0) {
+        legacyContacts = await Contact.find({ _id: { $in: remainingIds } }).lean();
+      }
+      
+      activityBasedContactsForFunnel = [...prospectContacts, ...legacyContacts];
+    }
+    
+    const allContactsForFunnel = [
+      ...allProjectContactsForFunnel.map(pc => ({
+        _id: pc.contactId?._id,
+        name: pc.contactId?.name,
+        email: pc.contactId?.email,
+        company: pc.contactId?.company
+      })),
+      ...activityBasedContactsForFunnel.map(c => ({
+        _id: c._id,
+        name: c.name,
+        email: c.email,
+        company: c.company
+      }))
+    ].filter(c => c._id);
+    
+    // Apply deduplication logic
+    const duplicateGroupsForFunnel = new Map();
+    allContactsForFunnel.forEach(contact => {
+      const email = (contact.email || '').trim().toLowerCase();
+      const name = (contact.name || '').trim().toLowerCase();
+      const company = (contact.company || '').trim().toLowerCase();
+      
+      let identifier = null;
+      if (email && email !== '') {
+        identifier = `email:${email}`;
+      } else if (name && name !== '' && company && company !== '') {
+        identifier = `name+company:${name}|${company}`;
+      } else if (name && name !== '') {
+        identifier = `name:${name}`;
+      }
+      
+      if (identifier) {
+        if (!duplicateGroupsForFunnel.has(identifier)) {
+          duplicateGroupsForFunnel.set(identifier, []);
+        }
+        duplicateGroupsForFunnel.get(identifier).push(contact);
+      }
+    });
+    
+    const contactsToKeepForFunnel = new Set();
+    const duplicateGroupsArrayForFunnel = Array.from(duplicateGroupsForFunnel.entries()).filter(([_, contacts]) => contacts.length > 1);
+    
+    if (duplicateGroupsArrayForFunnel.length > 0) {
+      const allDuplicateContactIdsForFunnel = [];
+      duplicateGroupsArrayForFunnel.forEach(([_, contacts]) => {
+        contacts.forEach(contact => {
+          const contactId = contact._id?.toString ? contact._id.toString() : String(contact._id);
+          if (contactId && mongoose.Types.ObjectId.isValid(contactId)) {
+            allDuplicateContactIdsForFunnel.push(new mongoose.Types.ObjectId(contactId));
+          }
+        });
+      });
+      
+      if (allDuplicateContactIdsForFunnel.length > 0) {
+        const mostRecentActivitiesForFunnel = await Activity.aggregate([
+          {
+            $match: {
+              ...projectFilter,
+              contactId: { $in: allDuplicateContactIdsForFunnel }
+            }
+          },
+          {
+            $group: {
+              _id: '$contactId',
+              mostRecentActivityDate: { $max: '$createdAt' }
+            }
+          }
+        ]);
+        
+        const activityDateMapForFunnel = new Map();
+        mostRecentActivitiesForFunnel.forEach(activity => {
+          if (activity._id) {
+            activityDateMapForFunnel.set(activity._id.toString(), activity.mostRecentActivityDate);
+          }
+        });
+        
+        for (const [identifier, contacts] of duplicateGroupsArrayForFunnel) {
+          let contactToKeep = null;
+          let mostRecentDate = null;
+          
+          contacts.forEach(contact => {
+            const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+            const activityDate = activityDateMapForFunnel.get(contactIdStr);
+            
+            if (activityDate) {
+              if (!mostRecentDate || activityDate > mostRecentDate) {
+                mostRecentDate = activityDate;
+                contactToKeep = contact;
+              }
+            } else if (!contactToKeep) {
+              contactToKeep = contact;
+            }
+          });
+          
+          if (!contactToKeep) {
+            contactToKeep = contacts[0];
+          }
+          
+          const contactToKeepId = contactToKeep._id?.toString ? contactToKeep._id.toString() : String(contactToKeep._id);
+          contactsToKeepForFunnel.add(contactToKeepId);
+        }
+      }
+    }
+    
+    const validContactIdsForFunnel = new Set();
+    allContactsForFunnel.forEach(contact => {
+      const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+      const email = (contact.email || '').trim().toLowerCase();
+      const name = (contact.name || '').trim().toLowerCase();
+      const company = (contact.company || '').trim().toLowerCase();
+      
+      let identifier = null;
+      if (email && email !== '') {
+        identifier = `email:${email}`;
+      } else if (name && name !== '' && company && company !== '') {
+        identifier = `name+company:${name}|${company}`;
+      } else if (name && name !== '') {
+        identifier = `name:${name}`;
+      }
+      
+      if (identifier) {
+        const isDuplicate = duplicateGroupsForFunnel.has(identifier) && duplicateGroupsForFunnel.get(identifier).length > 1;
+        if (!isDuplicate || contactsToKeepForFunnel.has(contactIdStr)) {
+          validContactIdsForFunnel.add(contactIdStr);
+        }
+      } else {
+        validContactIdsForFunnel.add(contactIdStr);
+      }
+    });
 
-      // Calls Attempted
-      if (c.callDate) {
+    // Process all call activities to count unique contacts that have EVER reached each stage
+    // Only count activities from deduplicated contacts
+    callFunnel.forEach(c => {
+      const contactId = c.contactId?.toString();
+      if (!contactId || !validContactIdsForFunnel.has(contactId)) return;
+
+      // Calls Attempted - any call activity
+      if (c.callDate || c.callStatus) {
         callsAttemptedSet.add(contactId);
       }
 
-      // Calls Connected - if callStatus indicates a connection
-      const connectedStatuses = ['Interested', 'Not Interested', 'Call Back', 'Future', 'Details Shared', 'Demo Booked', 'Demo Completed', 'Existing'];
-      if (c.callStatus && connectedStatuses.includes(c.callStatus)) {
+      // Calls Connected - if callStatus indicates a connection (not failed statuses)
+      // Same logic as KPI endpoint
+      if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(c.callStatus)) {
         callsConnectedSet.add(contactId);
       }
 
-      // Decision Maker Reached
-      const decisionMakerStatuses = ['Interested', 'Details Shared', 'Demo Booked', 'Demo Completed'];
-      if (c.callStatus && decisionMakerStatuses.includes(c.callStatus)) {
+      // Decision Maker Reached - answered and not "Not Interested"
+      // Same logic as KPI endpoint
+      if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(c.callStatus)) {
         decisionMakerReachedSet.add(contactId);
       }
 
-      // Interested
+      // Interested - exact match (same as KPI endpoint)
       if (c.callStatus === 'Interested') {
         interestedSet.add(contactId);
       }
 
-      // Details Shared
+      // Details Shared - exact match (same as KPI endpoint)
       if (c.callStatus === 'Details Shared') {
         detailsSharedSet.add(contactId);
       }
 
-      // Demo Booked
+      // Demo Booked - exact match (same as KPI endpoint)
       if (c.callStatus === 'Demo Booked') {
         demoBookedSet.add(contactId);
       }
 
-      // Demo Completed
+      // Demo Completed - exact match (same as KPI endpoint)
       if (c.callStatus === 'Demo Completed') {
         demoCompletedSet.add(contactId);
       }
+    });
 
-      // SQL
-      if (c.callStatus === 'Demo Completed' || 
-          (c.callStatus === 'Interested' && c.conversationNotes && c.conversationNotes.length > 50)) {
-        sqlSet.add(contactId);
+    // Get SQL and WON from ProjectContact stage (same as KPI endpoint)
+    const sqlContacts = await ProjectContact.find({
+      ...projectFilter,
+      stage: 'SQL'
+    }).distinct('contactId');
+    sqlContacts.forEach(contactId => {
+      if (contactId) {
+        sqlSet.add(contactId.toString());
       }
     });
 
-    // Get WON from ProjectContact stage
-    const wonCount = await ProjectContact.countDocuments({
+    const wonContacts = await ProjectContact.find({
       ...projectFilter,
       stage: 'WON'
+    }).distinct('contactId');
+    wonContacts.forEach(contactId => {
+      if (contactId) {
+        wonSet.add(contactId.toString());
+      }
     });
 
     const callFunnelData = {
       prospectData: totalProspects,
-      // New 10-stage structure
+      // New 10-stage structure - counts unique contacts that have EVER reached each stage
       callsAttempted: callsAttemptedSet.size,
       callsConnected: callsConnectedSet.size,
       decisionMakerReached: decisionMakerReachedSet.size,
@@ -1153,7 +1359,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       demoBooked: demoBookedSet.size,
       demoCompleted: demoCompletedSet.size,
       sql: sqlSet.size,
-      won: wonCount,
+      won: wonSet.size,
       // Legacy fields for backward compatibility
       callSent: callsAttemptedSet.size,
       accepted: callsConnectedSet.size,
@@ -1386,6 +1592,577 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
   }
 });
 
+// Get team member funnel data for Prospect Analytics Dashboard
+// IMPORTANT: This route must come before /:id to avoid route conflicts
+router.get('/team-member-funnels', authenticate, async (req, res) => {
+  try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    const { projectId } = req.query;
+    
+    // Build project filter
+    let projectFilter = {};
+    if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+      const projectObjectId = new mongoose.Types.ObjectId(projectId);
+      if (!isAdmin) {
+        const project = await Project.findOne({
+          _id: projectObjectId,
+          $or: [
+            { createdBy: user._id },
+            { teamMembers: { $in: [user.email.toLowerCase()] } }
+          ]
+        });
+        if (!project) {
+          return res.status(403).json({
+            success: false,
+            error: 'Access denied to this project'
+          });
+        }
+      }
+      projectFilter.projectId = projectObjectId;
+    } else if (!isAdmin) {
+      const projects = await Project.find({
+        $or: [
+          { createdBy: user._id },
+          { teamMembers: { $in: [user.email.toLowerCase()] } }
+        ]
+      }).lean();
+      const projectIds = projects.map(p => p._id);
+      projectFilter.projectId = { $in: projectIds };
+    }
+    
+    // Get all team members who have activities
+    const teamMembers = await Activity.aggregate([
+      { $match: projectFilter },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'createdBy',
+          foreignField: '_id',
+          as: 'user'
+        }
+      },
+      { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: '$createdBy',
+          name: { $first: '$user.name' },
+          email: { $first: '$user.email' }
+        }
+      },
+      { $sort: { name: 1 } }
+    ]);
+    
+    // Get total prospects for the project
+    const totalProspects = await ProjectContact.countDocuments(projectFilter);
+    
+    // Calculate funnel data for each team member
+    const teamMemberFunnels = await Promise.all(
+      teamMembers.map(async (member) => {
+        const memberId = member._id;
+        if (!memberId) return null;
+        
+        const memberActivityFilter = {
+          ...projectFilter,
+          createdBy: memberId
+        };
+        
+        // Get all call activities for this member
+        const callActivities = await Activity.aggregate([
+          {
+            $match: {
+              ...memberActivityFilter,
+              type: 'call',
+              contactId: { $ne: null, $exists: true }
+            }
+          },
+          {
+            $project: {
+              contactId: 1,
+              callDate: 1,
+              callStatus: 1,
+              createdAt: 1
+            }
+          },
+          {
+            $sort: { createdAt: -1 }
+          }
+        ]);
+        
+        // Calculate call funnel stages (unique contacts)
+        const callsAttemptedSet = new Set();
+        const callsConnectedSet = new Set();
+        const decisionMakerReachedSet = new Set();
+        const interestedSet = new Set();
+        const detailsSharedSet = new Set();
+        const demoBookedSet = new Set();
+        const demoCompletedSet = new Set();
+        
+        callActivities.forEach(c => {
+          const contactId = c.contactId?.toString();
+          if (!contactId) return;
+          
+          if (c.callDate || c.callStatus) {
+            callsAttemptedSet.add(contactId);
+          }
+          
+          if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(c.callStatus)) {
+            callsConnectedSet.add(contactId);
+          }
+          
+          if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(c.callStatus)) {
+            decisionMakerReachedSet.add(contactId);
+          }
+          
+          if (c.callStatus === 'Interested') {
+            interestedSet.add(contactId);
+          }
+          
+          if (c.callStatus === 'Details Shared') {
+            detailsSharedSet.add(contactId);
+          }
+          
+          if (c.callStatus === 'Demo Booked') {
+            demoBookedSet.add(contactId);
+          }
+          
+          if (c.callStatus === 'Demo Completed') {
+            demoCompletedSet.add(contactId);
+          }
+        });
+        
+        // Get SQL and WON from ProjectContact for this member's contacts
+        const memberContactIds = Array.from(new Set(callActivities.map(a => a.contactId?.toString()).filter(Boolean)));
+        const memberContactObjectIds = memberContactIds
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id));
+        
+        const sqlCount = memberContactObjectIds.length > 0 
+          ? await ProjectContact.countDocuments({
+              ...projectFilter,
+              contactId: { $in: memberContactObjectIds },
+              stage: 'SQL'
+            })
+          : 0;
+        
+        const wonCount = memberContactObjectIds.length > 0
+          ? await ProjectContact.countDocuments({
+              ...projectFilter,
+              contactId: { $in: memberContactObjectIds },
+              stage: 'WON'
+            })
+          : 0;
+        
+        // Get LinkedIn activities for this member
+        const linkedinActivities = await Activity.aggregate([
+          {
+            $match: {
+              ...memberActivityFilter,
+              type: 'linkedin',
+              contactId: { $ne: null, $exists: true }
+            }
+          },
+          {
+            $project: {
+              contactId: 1,
+              linkedinDate: 1,
+              lnRequestSent: 1,
+              connected: 1,
+              status: 1,
+              createdAt: 1
+            }
+          },
+          {
+            $sort: { createdAt: -1 }
+          }
+        ]);
+        
+        // Calculate LinkedIn funnel stages
+        const linkedinConnectionSentSet = new Set();
+        const linkedinAcceptedSet = new Set();
+        const linkedinCipSet = new Set();
+        const linkedinMeetingProposedSet = new Set();
+        const linkedinScheduledSet = new Set();
+        const linkedinCompletedSet = new Set();
+        const linkedinSqlSet = new Set();
+        
+        linkedinActivities.forEach(l => {
+          const contactId = l.contactId?.toString();
+          if (!contactId) return;
+          
+          if (l.lnRequestSent === 'Yes' || l.lnRequestSent === true) {
+            linkedinConnectionSentSet.add(contactId);
+          }
+          
+          const currentStatus = l.status;
+          
+          if ((l.connected === 'Yes' || l.connected === true) && 
+              (!currentStatus || currentStatus === '' || 
+               (!['CIP', 'Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'SQL'].includes(currentStatus)))) {
+            linkedinAcceptedSet.add(contactId);
+          }
+          
+          if (currentStatus === 'CIP') {
+            linkedinCipSet.add(contactId);
+            linkedinAcceptedSet.delete(contactId);
+          }
+          
+          if (currentStatus === 'Meeting Proposed') {
+            linkedinMeetingProposedSet.add(contactId);
+            linkedinAcceptedSet.delete(contactId);
+            linkedinCipSet.delete(contactId);
+          }
+          
+          if (currentStatus === 'Meeting Scheduled') {
+            linkedinScheduledSet.add(contactId);
+            linkedinAcceptedSet.delete(contactId);
+            linkedinCipSet.delete(contactId);
+            linkedinMeetingProposedSet.delete(contactId);
+          }
+          
+          if (currentStatus === 'Meeting Completed') {
+            linkedinCompletedSet.add(contactId);
+            linkedinAcceptedSet.delete(contactId);
+            linkedinCipSet.delete(contactId);
+            linkedinMeetingProposedSet.delete(contactId);
+            linkedinScheduledSet.delete(contactId);
+          }
+          
+          if (currentStatus === 'SQL' || currentStatus === 'Meeting Completed') {
+            linkedinSqlSet.add(contactId);
+          }
+        });
+        
+        // Get LinkedIn SQL and WON
+        const linkedinContactIds = Array.from(new Set(linkedinActivities.map(a => a.contactId?.toString()).filter(Boolean)));
+        const linkedinContactObjectIds = linkedinContactIds
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id));
+        
+        const linkedinSqlCount = linkedinContactObjectIds.length > 0
+          ? await ProjectContact.countDocuments({
+              ...projectFilter,
+              contactId: { $in: linkedinContactObjectIds },
+              stage: 'SQL'
+            })
+          : 0;
+        
+        const linkedinWonCount = linkedinContactObjectIds.length > 0
+          ? await ProjectContact.countDocuments({
+              ...projectFilter,
+              contactId: { $in: linkedinContactObjectIds },
+              stage: 'WON'
+            })
+          : 0;
+        
+        // Get Email activities for this member
+        const emailActivities = await Activity.aggregate([
+          {
+            $match: {
+              ...memberActivityFilter,
+              type: 'email',
+              contactId: { $ne: null, $exists: true }
+            }
+          },
+          {
+            $project: {
+              contactId: 1,
+              emailDate: 1,
+              status: 1,
+              createdAt: 1
+            }
+          },
+          {
+            $sort: { createdAt: -1 }
+          }
+        ]);
+        
+        // Calculate Email funnel stages
+        const emailSentSet = new Set();
+        const emailAcceptedSet = new Set();
+        const emailCipSet = new Set();
+        const emailMeetingProposedSet = new Set();
+        const emailScheduledSet = new Set();
+        const emailCompletedSet = new Set();
+        const emailSqlSet = new Set();
+        
+        emailActivities.forEach(e => {
+          const contactId = e.contactId?.toString();
+          if (!contactId) return;
+          
+          if (e.emailDate) {
+            emailSentSet.add(contactId);
+          }
+          
+          if (['Interested', 'Meeting Proposed'].includes(e.status)) {
+            emailAcceptedSet.add(contactId);
+          }
+          
+          if (e.status === 'CIP') {
+            emailCipSet.add(contactId);
+          }
+          
+          if (e.status === 'Meeting Proposed') {
+            emailMeetingProposedSet.add(contactId);
+          }
+          
+          if (e.status === 'Meeting Scheduled') {
+            emailScheduledSet.add(contactId);
+          }
+          
+          if (e.status === 'Meeting Completed') {
+            emailCompletedSet.add(contactId);
+          }
+          
+          if (e.status === 'SQL' || e.status === 'Meeting Completed') {
+            emailSqlSet.add(contactId);
+          }
+        });
+        
+        return {
+          memberId: memberId.toString(),
+          name: member.name || 'Unknown',
+          email: member.email || '',
+          funnels: {
+            coldCalling: {
+              prospectData: totalProspects,
+              callsAttempted: callsAttemptedSet.size,
+              callsConnected: callsConnectedSet.size,
+              decisionMakerReached: decisionMakerReachedSet.size,
+              interested: interestedSet.size,
+              detailsShared: detailsSharedSet.size,
+              demoBooked: demoBookedSet.size,
+              demoCompleted: demoCompletedSet.size,
+              sql: sqlCount,
+              won: wonCount
+            },
+            linkedin: {
+              prospectData: totalProspects,
+              connectionSent: linkedinConnectionSentSet.size,
+              accepted: linkedinAcceptedSet.size,
+              cip: linkedinCipSet.size,
+              meetingProposed: linkedinMeetingProposedSet.size,
+              scheduled: linkedinScheduledSet.size,
+              completed: linkedinCompletedSet.size,
+              sql: linkedinSqlCount,
+              win: linkedinWonCount
+            },
+            email: {
+              prospectData: totalProspects,
+              emailSent: emailSentSet.size,
+              accepted: emailAcceptedSet.size,
+              cip: emailCipSet.size,
+              meetingProposed: emailMeetingProposedSet.size,
+              scheduled: emailScheduledSet.size,
+              completed: emailCompletedSet.size,
+              sql: emailSqlSet.size
+            }
+          }
+        };
+      })
+    );
+    
+    // Filter out null entries
+    const validFunnels = teamMemberFunnels.filter(f => f !== null);
+    
+    res.json({
+      success: true,
+      data: validFunnels
+    });
+  } catch (error) {
+    console.error('Error fetching team member funnels:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch team member funnels'
+    });
+  }
+});
+
+// Get employee performance data
+// IMPORTANT: This route must come before /:id to avoid route conflicts
+router.get('/employee-performance', authenticate, async (req, res) => {
+  try {
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+
+    // Get all users (only admins can see all users, others see only themselves)
+    let userFilter = {};
+    if (!isAdmin) {
+      userFilter._id = user._id;
+    }
+
+    const users = await User.find(userFilter).select('_id name email').lean();
+
+    // Get all projects for filtering
+    let projectFilter = {};
+    if (!isAdmin) {
+      projectFilter.$or = [
+        { createdBy: user._id },
+        { teamMembers: user.email.toLowerCase() }
+      ];
+    }
+
+    const projects = await Project.find(projectFilter).select('_id companyName createdBy teamMembers').lean();
+
+    // Build employee performance data
+    const employeePerformance = await Promise.all(
+      users.map(async (employee) => {
+        // Get projects where user is creator or team member
+        const userProjects = projects.filter(p => 
+          p.createdBy.toString() === employee._id.toString() ||
+          (p.teamMembers && p.teamMembers.some(email => email.toLowerCase() === employee.email.toLowerCase()))
+        );
+
+        const projectIds = userProjects.map(p => p._id);
+
+        if (projectIds.length === 0) {
+          return {
+            userId: employee._id.toString(),
+            name: employee.name || employee.email,
+            email: employee.email,
+            projects: [],
+            totalActivities: 0,
+            byChannel: {
+              email: { total: 0, byStatus: {} },
+              call: { total: 0, byStatus: {} },
+              linkedin: { total: 0, byStatus: {} }
+            },
+            byProject: []
+          };
+        }
+
+        // Build activity match filter with time filter
+        const activityMatch = {
+          projectId: { $in: projectIds.map(id => new mongoose.Types.ObjectId(id)) },
+          createdBy: new mongoose.Types.ObjectId(employee._id)
+        };
+
+        // Add date filter if timeFilter is provided
+        const { timeFilter } = req.query;
+        if (timeFilter) {
+          const now = new Date();
+          if (timeFilter === 'today') {
+            const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            activityMatch.createdAt = { $gte: startOfToday };
+          } else if (timeFilter === 'last7days') {
+            const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            activityMatch.createdAt = { $gte: sevenDaysAgo };
+          } else if (timeFilter === 'lastMonth') {
+            const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate());
+            activityMatch.createdAt = { $gte: lastMonth };
+          }
+        }
+
+        // Get all activities for this user's projects
+        const activities = await Activity.aggregate([
+          {
+            $match: activityMatch
+          },
+          {
+            $lookup: {
+              from: 'projects',
+              localField: 'projectId',
+              foreignField: '_id',
+              as: 'project'
+            }
+          },
+          {
+            $unwind: {
+              path: '$project',
+              preserveNullAndEmptyArrays: true
+            }
+          }
+        ]);
+
+        // Calculate metrics by channel and status
+        const byChannel = {
+          email: { total: 0, byStatus: {} },
+          call: { total: 0, byStatus: {} },
+          linkedin: { total: 0, byStatus: {} }
+        };
+
+        // Calculate metrics by project
+        const byProjectMap = new Map();
+
+        activities.forEach(activity => {
+          const channel = activity.type;
+          const status = activity.status || activity.callStatus || 'No Status';
+          const projectId = activity.projectId?.toString();
+          const projectName = activity.project?.companyName || 'Unknown';
+
+          // Update channel metrics
+          if (byChannel[channel]) {
+            byChannel[channel].total++;
+            byChannel[channel].byStatus[status] = (byChannel[channel].byStatus[status] || 0) + 1;
+          }
+
+          // Update project metrics
+          if (!byProjectMap.has(projectId)) {
+            byProjectMap.set(projectId, {
+              projectId,
+              projectName,
+              total: 0,
+              email: 0,
+              call: 0,
+              linkedin: 0
+            });
+          }
+
+          const projectData = byProjectMap.get(projectId);
+          projectData.total++;
+          if (channel === 'email') projectData.email++;
+          if (channel === 'call') projectData.call++;
+          if (channel === 'linkedin') projectData.linkedin++;
+        });
+
+        const byProject = Array.from(byProjectMap.values());
+
+        return {
+          userId: employee._id.toString(),
+          name: employee.name || employee.email,
+          email: employee.email,
+          projects: userProjects.map(p => ({
+            id: p._id.toString(),
+            companyName: p.companyName,
+            isCreator: p.createdBy.toString() === employee._id.toString(),
+            isTeamMember: p.teamMembers && p.teamMembers.some(email => email.toLowerCase() === employee.email.toLowerCase())
+          })),
+          totalActivities: activities.length,
+          byChannel,
+          byProject
+        };
+      })
+    );
+
+    // Calculate summary statistics
+    const summary = {
+      totalEmployees: employeePerformance.length,
+      totalActivities: employeePerformance.reduce((sum, emp) => sum + emp.totalActivities, 0),
+      totalProjects: new Set(employeePerformance.flatMap(emp => emp.projects.map(p => p.id))).size,
+      byChannel: {
+        email: employeePerformance.reduce((sum, emp) => sum + emp.byChannel.email.total, 0),
+        call: employeePerformance.reduce((sum, emp) => sum + emp.byChannel.call.total, 0),
+        linkedin: employeePerformance.reduce((sum, emp) => sum + emp.byChannel.linkedin.total, 0)
+      }
+    };
+
+    res.json({
+      success: true,
+      data: {
+        employees: employeePerformance,
+        summary
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching employee performance:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch employee performance'
+    });
+  }
+});
+
+// Get all projects
 // Get all projects
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -1395,21 +2172,48 @@ router.get('/', authenticate, async (req, res) => {
     
     let filter = {};
     
-    // Filter by user unless admin
+    // Build access control conditions for non-admin users
+    let accessConditions = [];
     if (!isAdmin) {
-      filter.createdBy = user._id;
+      accessConditions.push(
+        { createdBy: user._id },
+        { teamMembers: { $in: [user.email.toLowerCase()] } }
+      );
     }
+
+    // Build search conditions
+    let searchConditions = [];
+    if (search) {
+      searchConditions.push(
+        { companyName: { $regex: search, $options: 'i' } },
+        { 'contactPerson.fullName': { $regex: search, $options: 'i' } },
+        { 'contactPerson.email': { $regex: search, $options: 'i' } }
+      );
+    }
+
+    // Combine filters properly
+    if (accessConditions.length > 0 && searchConditions.length > 0) {
+      // Both access and search filters exist - use $and to combine them
+      filter.$and = [
+        { $or: accessConditions },
+        { $or: searchConditions }
+      ];
+    } else if (accessConditions.length > 0) {
+      // Only access filter (non-admin users)
+      filter.$or = accessConditions;
+    } else if (searchConditions.length > 0) {
+      // Only search filter (admin users with search)
+      filter.$or = searchConditions;
+    }
+    // If both are empty (admin with no search), filter remains {} which matches all
 
     if (status) {
       filter.status = status;
     }
 
-    if (search) {
-      filter.$or = [
-        { companyName: { $regex: search, $options: 'i' } },
-        { 'contactPerson.fullName': { $regex: search, $options: 'i' } },
-        { 'contactPerson.email': { $regex: search, $options: 'i' } }
-      ];
+    // Debug: Log filter for admins to verify
+    if (isAdmin) {
+      console.log('Admin user - Filter:', JSON.stringify(filter, null, 2));
     }
 
     // Use aggregation for better performance - single query instead of populate + manual fetch
@@ -1457,22 +2261,23 @@ router.get('/', authenticate, async (req, res) => {
             {
               $match: {
                 $expr: {
-                  $and: [
-                    { $eq: ['$projectId', '$$projectId'] },
-                    { $in: ['$stage', ['SQL', 'WON']] }
-                  ]
+                  $eq: ['$projectId', '$$projectId']
                 }
               }
             },
             {
-              $count: 'count'
+              $group: {
+                _id: '$stage',
+                count: { $sum: 1 }
+              }
             }
           ],
-          as: 'leadsCountArray'
+          as: 'leadsByStage'
         }
       },
       {
         $project: {
+          _id: 1,
           companyName: 1,
           website: 1,
           city: 1,
@@ -1502,10 +2307,53 @@ router.get('/', authenticate, async (req, res) => {
           leadsGenerated: {
             $let: {
               vars: {
-                countDoc: { $arrayElemAt: ['$leadsCountArray', 0] }
+                sqlWonLeads: {
+                  $filter: {
+                    input: '$leadsByStage',
+                    as: 'lead',
+                    cond: { $in: ['$$lead._id', ['SQL', 'WON']] }
+                  }
+                }
               },
               in: {
-                $ifNull: ['$$countDoc.count', 0]
+                $sum: {
+                  $map: {
+                    input: '$$sqlWonLeads',
+                    as: 'lead',
+                    in: '$$lead.count'
+                  }
+                }
+              }
+            }
+          },
+          leadsByStatus: {
+            $let: {
+              vars: {
+                stageMap: {
+                  $arrayToObject: {
+                    $map: {
+                      input: '$leadsByStage',
+                      as: 'lead',
+                      in: {
+                        k: { $ifNull: ['$$lead._id', 'New'] },
+                        v: '$$lead.count'
+                      }
+                    }
+                  }
+                }
+              },
+              in: {
+                new: { $ifNull: ['$$stageMap.New', 0] },
+                interested: { $ifNull: ['$$stageMap.Interested', 0] },
+                cip: { $ifNull: ['$$stageMap.CIP', 0] },
+                detailsShared: { $ifNull: ['$$stageMap.Details Shared', 0] },
+                demoBooked: { $ifNull: ['$$stageMap.Demo Booked', 0] },
+                demoCompleted: { $ifNull: ['$$stageMap.Demo Completed', 0] },
+                sql: { $ifNull: ['$$stageMap.SQL', 0] },
+                won: { $ifNull: ['$$stageMap.WON', 0] },
+                meetingProposed: { $ifNull: ['$$stageMap.Meeting Proposed', 0] },
+                meetingScheduled: { $ifNull: ['$$stageMap.Meeting Scheduled', 0] },
+                meetingCompleted: { $ifNull: ['$$stageMap.Meeting Completed', 0] }
               }
             }
           },
@@ -1554,9 +2402,12 @@ router.get('/:id', authenticate, async (req, res) => {
 
     let filter = { _id: projectId };
     
-    // Filter by user unless admin
+    // Filter by user unless admin - include projects where user is creator OR team member
     if (!isAdmin) {
-      filter.createdBy = user._id;
+      filter.$or = [
+        { _id: projectId, createdBy: user._id },
+        { _id: projectId, teamMembers: { $in: [user.email.toLowerCase()] } }
+      ];
     }
 
     const project = await Project.findOne(filter).lean();
@@ -1716,6 +2567,514 @@ const calculateMatchScore = (contact, icpDefinition) => {
   };
 };
 
+// Get KPI metrics for a project
+router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
+  try {
+    const projectId = req.params.id;
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+
+    // Validate ObjectId
+    if (!mongoose.Types.ObjectId.isValid(projectId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid project ID format'
+      });
+    }
+
+    const projectObjectId = new mongoose.Types.ObjectId(projectId);
+
+    // Check if project exists and user has access
+    let projectFilter = { _id: projectObjectId };
+    if (!isAdmin) {
+      projectFilter.createdBy = user._id;
+    }
+    const projectExists = await Project.exists(projectFilter);
+    if (!projectExists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Project not found'
+      });
+    }
+
+    // Build activity filter
+    let activityFilter = { projectId: projectObjectId };
+    if (!isAdmin) {
+      activityFilter.createdBy = user._id;
+    }
+
+    // Get all activities for this project
+    const Activity = require('../models/Activity');
+    const activities = await Activity.find(activityFilter).lean();
+
+    // Calculate Call KPIs and Funnel Stages
+    const callActivities = activities.filter(a => a.type === 'call');
+    const callsMade = callActivities.length;
+    const callsAnswered = callActivities.filter(a => 
+      a.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(a.callStatus)
+    ).length;
+    const callAnswerRate = callsMade > 0 
+      ? ((callsAnswered / callsMade) * 100).toFixed(1) 
+      : '0.0';
+    const callsInterested = callActivities.filter(a => 
+      a.callStatus && ['Interested', 'Details Shared', 'Demo Booked', 'Demo Completed'].includes(a.callStatus)
+    ).length;
+    const callInterestedRate = callsMade > 0 
+      ? ((callsInterested / callsMade) * 100).toFixed(1) 
+      : '0.0';
+    const callMeetings = callActivities.filter(a => 
+      a.callStatus && ['Demo Booked', 'Demo Completed'].includes(a.callStatus)
+    ).length;
+
+    // Calculate Call Funnel Stages
+    // First, get all unique contacts for this project (after deduplication) to ensure counts match what users see
+    // Get all project contacts
+    const allProjectContacts = await ProjectContact.find({ projectId: projectObjectId })
+      .populate('contactId', 'name email company')
+      .lean();
+    
+    // Also get activity-based contacts (contacts with activities but no ProjectContact entry)
+    const activityContactIds = await Activity.distinct('contactId', {
+      projectId: projectObjectId,
+      contactId: { $ne: null, $exists: true }
+    });
+    
+    const existingContactIds = new Set(
+      allProjectContacts
+        .map(pc => pc.contactId?._id?.toString())
+        .filter(Boolean)
+    );
+    
+    const missingContactIds = activityContactIds.filter(
+      contactId => contactId && !existingContactIds.has(contactId.toString())
+    );
+    
+    // Get contact details for activity-based contacts
+    let activityBasedContacts = [];
+    if (missingContactIds.length > 0) {
+      const missingObjectIds = missingContactIds
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id));
+      
+      const prospectContacts = await ProspectContact.find({ _id: { $in: missingObjectIds } }).lean();
+      const foundIds = new Set(prospectContacts.map(c => c._id.toString()));
+      const remainingIds = missingObjectIds.filter(id => !foundIds.has(id.toString()));
+      
+      let legacyContacts = [];
+      if (remainingIds.length > 0) {
+        legacyContacts = await Contact.find({ _id: { $in: remainingIds } }).lean();
+      }
+      
+      activityBasedContacts = [...prospectContacts, ...legacyContacts];
+    }
+    
+    // Combine all contacts
+    const allContacts = [
+      ...allProjectContacts.map(pc => ({
+        _id: pc.contactId?._id,
+        name: pc.contactId?.name,
+        email: pc.contactId?.email,
+        company: pc.contactId?.company
+      })),
+      ...activityBasedContacts.map(c => ({
+        _id: c._id,
+        name: c.name,
+        email: c.email,
+        company: c.company
+      }))
+    ].filter(c => c._id);
+    
+    // Apply deduplication logic (same as project-contacts endpoint)
+    const duplicateGroups = new Map();
+    allContacts.forEach(contact => {
+      const email = (contact.email || '').trim().toLowerCase();
+      const name = (contact.name || '').trim().toLowerCase();
+      const company = (contact.company || '').trim().toLowerCase();
+      
+      let identifier = null;
+      if (email && email !== '') {
+        identifier = `email:${email}`;
+      } else if (name && name !== '' && company && company !== '') {
+        identifier = `name+company:${name}|${company}`;
+      } else if (name && name !== '') {
+        identifier = `name:${name}`;
+      }
+      
+      if (identifier) {
+        if (!duplicateGroups.has(identifier)) {
+          duplicateGroups.set(identifier, []);
+        }
+        duplicateGroups.get(identifier).push(contact);
+      }
+    });
+    
+    // For each duplicate group, find the contact with the most recent activity
+    const contactsToKeep = new Set();
+    const duplicateGroupsArray = Array.from(duplicateGroups.entries()).filter(([_, contacts]) => contacts.length > 1);
+    
+    if (duplicateGroupsArray.length > 0) {
+      const allDuplicateContactIds = [];
+      duplicateGroupsArray.forEach(([_, contacts]) => {
+        contacts.forEach(contact => {
+          const contactId = contact._id?.toString ? contact._id.toString() : String(contact._id);
+          if (contactId && mongoose.Types.ObjectId.isValid(contactId)) {
+            allDuplicateContactIds.push(new mongoose.Types.ObjectId(contactId));
+          }
+        });
+      });
+      
+      if (allDuplicateContactIds.length > 0) {
+        const mostRecentActivities = await Activity.aggregate([
+          {
+            $match: {
+              projectId: projectObjectId,
+              contactId: { $in: allDuplicateContactIds }
+            }
+          },
+          {
+            $group: {
+              _id: '$contactId',
+              mostRecentActivityDate: { $max: '$createdAt' }
+            }
+          }
+        ]);
+        
+        const activityDateMap = new Map();
+        mostRecentActivities.forEach(activity => {
+          if (activity._id) {
+            activityDateMap.set(activity._id.toString(), activity.mostRecentActivityDate);
+          }
+        });
+        
+        for (const [identifier, contacts] of duplicateGroupsArray) {
+          let contactToKeep = null;
+          let mostRecentDate = null;
+          
+          contacts.forEach(contact => {
+            const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+            const activityDate = activityDateMap.get(contactIdStr);
+            
+            if (activityDate) {
+              if (!mostRecentDate || activityDate > mostRecentDate) {
+                mostRecentDate = activityDate;
+                contactToKeep = contact;
+              }
+            } else if (!contactToKeep) {
+              contactToKeep = contact;
+            }
+          });
+          
+          if (!contactToKeep) {
+            contactToKeep = contacts[0];
+          }
+          
+          const contactToKeepId = contactToKeep._id?.toString ? contactToKeep._id.toString() : String(contactToKeep._id);
+          contactsToKeep.add(contactToKeepId);
+        }
+      }
+    }
+    
+    // Get final list of contactIds to count (after deduplication)
+    const validContactIds = new Set();
+    allContacts.forEach(contact => {
+      const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+      const email = (contact.email || '').trim().toLowerCase();
+      const name = (contact.name || '').trim().toLowerCase();
+      const company = (contact.company || '').trim().toLowerCase();
+      
+      let identifier = null;
+      if (email && email !== '') {
+        identifier = `email:${email}`;
+      } else if (name && name !== '' && company && company !== '') {
+        identifier = `name+company:${name}|${company}`;
+      } else if (name && name !== '') {
+        identifier = `name:${name}`;
+      }
+      
+      if (identifier) {
+        const isDuplicate = duplicateGroups.has(identifier) && duplicateGroups.get(identifier).length > 1;
+        if (!isDuplicate || contactsToKeep.has(contactIdStr)) {
+          validContactIds.add(contactIdStr);
+        }
+      } else {
+        // No identifier, include it
+        validContactIds.add(contactIdStr);
+      }
+    });
+    
+    // Now count only activities from deduplicated contacts
+    const callsAttempted = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && (a.callDate || a.callStatus);
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const callsConnected = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(a.callStatus);
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const decisionMakerReached = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(a.callStatus);
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const interested = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Interested';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const detailsShared = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Details Shared';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const demoBooked = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Demo Booked';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const demoCompleted = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Demo Completed';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    // Get SQL and WON from project contacts (stage field) for deduplicated contacts
+    const sqlContacts = await ProjectContact.countDocuments({ 
+      projectId: projectObjectId, 
+      contactId: { $in: Array.from(validContactIds).map(id => new mongoose.Types.ObjectId(id)) },
+      stage: 'SQL' 
+    });
+    const wonContacts = await ProjectContact.countDocuments({ 
+      projectId: projectObjectId, 
+      contactId: { $in: Array.from(validContactIds).map(id => new mongoose.Types.ObjectId(id)) },
+      stage: 'WON' 
+    });
+
+    // Calculate LinkedIn KPIs - New funnel structure (after deduplication)
+    const linkedInActivities = activities.filter(a => a.type === 'linkedin');
+    
+    // Count unique contacts for each stage (using deduplicated contacts)
+    const connectionSent = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               (a.lnRequestSent === true || a.lnRequestSent === 'Yes');
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    const accepted = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               (a.connected === true || a.connected === 'Yes');
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    // Follow-ups: contacts with more than 1 LinkedIn activity
+    const linkedInActivityCounts = new Map();
+    linkedInActivities.forEach(a => {
+      const contactIdStr = a.contactId?.toString();
+      if (contactIdStr && validContactIds.has(contactIdStr)) {
+        linkedInActivityCounts.set(contactIdStr, (linkedInActivityCounts.get(contactIdStr) || 0) + 1);
+      }
+    });
+    const followUps = Array.from(linkedInActivityCounts.values()).filter(count => count > 1).length;
+    
+    const cip = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.status && (a.status === 'CIP' || a.status === 'Conversations in Progress');
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    const meetingProposed = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.status && a.status === 'Meeting Proposed';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    const scheduled = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.status && a.status === 'Meeting Scheduled';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    const completed = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.status && a.status === 'Meeting Completed';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    // Get SQL and WON from project contacts (stage field) for deduplicated contacts
+    const linkedInSqlContacts = await ProjectContact.countDocuments({ 
+      projectId: projectObjectId, 
+      contactId: { $in: Array.from(validContactIds).map(id => new mongoose.Types.ObjectId(id)) },
+      stage: 'SQL' 
+    });
+    const linkedInWonContacts = await ProjectContact.countDocuments({ 
+      projectId: projectObjectId, 
+      contactId: { $in: Array.from(validContactIds).map(id => new mongoose.Types.ObjectId(id)) },
+      stage: 'WON' 
+    });
+    
+    // Legacy metrics (for backward compatibility if needed)
+    const connectionRequestsSent = connectionSent;
+    const connectionsAccepted = accepted;
+    const connectionAcceptanceRate = connectionSent > 0 
+      ? ((accepted / connectionSent) * 100).toFixed(1) 
+      : '0.0';
+    const messagesSent = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.status && a.status !== '';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const messageReplies = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.status && ['Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'SQL', 'Tech Discussion'].includes(a.status);
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    const messageReplyRate = messagesSent > 0 
+      ? ((messageReplies / messagesSent) * 100).toFixed(1) 
+      : '0.0';
+    const linkedInMeetings = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && 
+               a.status && ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting'].includes(a.status);
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+
+    // Calculate Email KPIs
+    const emailActivities = activities.filter(a => a.type === 'email');
+    const emailsSent = emailActivities.length;
+    const emailOpens = emailActivities.filter(a => 
+      a.status && a.status !== 'Bounce' && a.status !== 'Opt-Out' && a.status !== 'No Reply'
+    ).length;
+    const emailOpenRate = emailsSent > 0 
+      ? ((emailOpens / emailsSent) * 100).toFixed(1) 
+      : '0.0';
+    const emailReplies = emailActivities.filter(a => 
+      a.status && ['Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'SQL', 'Tech Discussion'].includes(a.status)
+    ).length;
+    const emailReplyRate = emailsSent > 0 
+      ? ((emailReplies / emailsSent) * 100).toFixed(1) 
+      : '0.0';
+    const emailMeetings = emailActivities.filter(a => 
+      a.status && ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting'].includes(a.status)
+    ).length;
+
+    res.json({
+      success: true,
+      data: {
+        linkedin: {
+          // New funnel metrics
+          connectionSent,
+          accepted,
+          followUps,
+          cip,
+          meetingProposed,
+          scheduled,
+          completed,
+          sql: linkedInSqlContacts,
+          win: linkedInWonContacts,
+          // Legacy metrics (for backward compatibility)
+          connectionRequestsSent,
+          connectionsAccepted,
+          connectionAcceptanceRate: parseFloat(connectionAcceptanceRate),
+          messagesSent,
+          messageReplies,
+          messageReplyRate: parseFloat(messageReplyRate),
+          meetingsBooked: linkedInMeetings
+        },
+        call: {
+          callsMade,
+          callsAnswered,
+          callAnswerRate: parseFloat(callAnswerRate),
+          callsInterested,
+          callInterestedRate: parseFloat(callInterestedRate),
+          meetingsBooked: callMeetings,
+          // Funnel stages
+          callsAttempted,
+          callsConnected,
+          decisionMakerReached,
+          interested,
+          detailsShared,
+          demoBooked,
+          demoCompleted,
+          sql: sqlContacts,
+          won: wonContacts
+        },
+        email: {
+          emailsSent,
+          emailOpens,
+          emailOpenRate: parseFloat(emailOpenRate),
+          emailReplies,
+          emailReplyRate: parseFloat(emailReplyRate),
+          meetingsBooked: emailMeetings
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching KPI metrics:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch KPI metrics'
+    });
+  }
+});
+
 // Get imported contacts for a project (only contacts already linked to project)
 router.get('/:id/project-contacts', authenticate, async (req, res) => {
   try {
@@ -1725,6 +3084,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
     // If no limit is specified, fetch all prospects (set to a high number)
     const limit = parseInt(req.query.limit) || 10000;
     const skip = (page - 1) * limit;
+    const search = req.query.search ? req.query.search.trim() : null;
 
     // Validate ObjectId
     if (!mongoose.Types.ObjectId.isValid(projectId)) {
@@ -1741,9 +3101,13 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
     const projectObjectId = new mongoose.Types.ObjectId(projectId);
 
     // Check if project exists and user has access (lightweight check)
+    // Include projects where user is creator OR team member
     let projectFilter = { _id: projectObjectId };
     if (!isAdmin) {
-      projectFilter.createdBy = user._id;
+      projectFilter.$or = [
+        { _id: projectObjectId, createdBy: user._id },
+        { _id: projectObjectId, teamMembers: { $in: [user.email.toLowerCase()] } }
+      ];
     }
     const projectExists = await Project.exists(projectFilter);
     if (!projectExists) {
@@ -1753,18 +3117,18 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       });
     }
 
-    // Use aggregation pipeline for better performance
-    // This avoids the N+1 query problem of populate()
-    // We check both ProspectContact and Contact collections to handle legacy data
+    // Optimized aggregation pipeline
+    // If searching, lookup contacts first, filter, then paginate
+    // If not searching, we can optimize by paginating early
     const pipeline = [
-      // Match project contacts
+      // Match project contacts - use index
       {
         $match: { projectId: projectObjectId }
       },
-      // Lookup prospect contacts first (new collection)
+      // Lookup prospect contacts (needed for search filtering)
       {
         $lookup: {
-          from: PROSPECT_CONTACT_COLLECTION, // MongoDB collection name (dynamically retrieved)
+          from: PROSPECT_CONTACT_COLLECTION,
           localField: 'contactId',
           foreignField: '_id',
           as: 'prospectContact'
@@ -1773,7 +3137,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       // Also lookup in Contact collection (legacy collection)
       {
         $lookup: {
-          from: 'contacts', // Legacy Contact collection
+          from: 'contacts',
           localField: 'contactId',
           foreignField: '_id',
           as: 'legacyContact'
@@ -1803,8 +3167,6 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
         }
       },
       // Filter out default/test prospects (no email AND no phone)
-      // These are typically test/sample data that should not be shown
-      // Keep prospects that have at least email OR phone
       {
         $match: {
           $or: [
@@ -1812,6 +3174,28 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
             { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
           ]
         }
+      },
+      // Apply search filter if provided (BEFORE pagination)
+      ...(search ? [{
+        $match: {
+          $or: [
+            { 'contact.name': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+            { 'contact.company': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+            { 'contact.email': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+            { 'contact.firstPhone': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+          ]
+        }
+      }] : []),
+      // Sort for consistent pagination
+      {
+        $sort: { createdAt: -1 }
+      },
+      // Apply pagination AFTER filtering (so search works across all contacts)
+      {
+        $skip: skip
+      },
+      {
+        $limit: limit
       },
       // Project only needed fields
       {
@@ -1842,14 +3226,11 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           isImported: { $literal: true },
           matchType: { $literal: 'imported' }
         }
-      },
-      // Sort by creation date (newest first)
-      {
-        $sort: { _id: -1 }
       }
     ];
 
     // Get total count for pagination (checking both collections)
+    // Must include search filter in count pipeline to get accurate total
     const countPipeline = [
       { $match: { projectId: projectObjectId } },
       {
@@ -1889,20 +3270,37 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           ]
         }
       },
+      // Apply search filter if provided (same as main pipeline)
+      ...(search ? [{
+        $match: {
+          $or: [
+            { 'contact.name': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+            { 'contact.company': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+            { 'contact.email': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+            { 'contact.firstPhone': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
+          ]
+        }
+      }] : []),
       { $count: 'total' }
     ];
 
-    // Execute queries in parallel to get ProjectContact-based prospects
-    // Note: We don't apply pagination here - we'll do it after combining with activity-based prospects
+    // Execute queries in parallel - optimized for performance
+    // Only fetch activity-based contacts on first page to avoid performance issues
     const [contactsResult, countResult] = await Promise.all([
-      ProjectContact.aggregate([
-        ...pipeline
-        // Pagination removed - will be applied after combining results
-      ]),
+      ProjectContact.aggregate(pipeline),
       ProjectContact.aggregate(countPipeline)
     ]);
 
-    // Also get prospects that have activities for this project but no ProjectContact entry
+    // Get total count from count pipeline
+    const total = countResult.length > 0 ? countResult[0].total : 0;
+    const totalPages = Math.ceil(total / limit);
+
+    // Only fetch activity-based prospects on first page to improve performance
+    // For subsequent pages, only show ProjectContact-based prospects
+    let additionalProspects = [];
+    if (page === 1) {
+      // Get prospects that have activities for this project but no ProjectContact entry
+      // Limit this query to avoid performance issues
     const activitiesWithContacts = await Activity.aggregate([
       {
         $match: {
@@ -1914,16 +3312,19 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
         $group: {
           _id: '$contactId'
         }
-      }
+        },
+        { $limit: 100 } // Limit to first 100 to avoid performance issues
     ]);
 
     const activityContactIds = activitiesWithContacts.map(a => a._id).filter(id => id != null);
     
+      if (activityContactIds.length > 0) {
     // Get contactIds that already have ProjectContact entries
     const existingProjectContacts = await ProjectContact.find(
       { projectId: projectObjectId },
       { contactId: 1 }
-    ).lean();
+        ).limit(100).lean(); // Limit to improve performance
+        
     const existingContactIds = new Set(
       existingProjectContacts
         .map(pc => pc.contactId)
@@ -1938,11 +3339,9 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
         const contactIdStr = contactId.toString();
         return !existingContactIds.has(contactIdStr);
       }
-    );
+        ).slice(0, 50); // Limit to 50 additional prospects
 
     // Fetch prospects that have activities but no ProjectContact entry
-    // Check both ProspectContact and Contact collections
-    let additionalProspects = [];
     if (missingContactIds.length > 0) {
       const missingObjectIds = missingContactIds.map(id => new mongoose.Types.ObjectId(id));
       
@@ -1992,16 +3391,18 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
         companyLinkedinUrl: contact.companyLinkedinUrl,
         website: contact.website,
         employees: contact.employees,
-        projectContactId: null, // No ProjectContact entry
-        stage: 'New', // Default stage
-        assignedTo: '', // Default assignedTo
-        priority: 'Medium', // Default priority
+            projectContactId: null,
+            stage: 'New',
+            assignedTo: '',
+            priority: 'Medium',
         isImported: false,
         matchType: 'activity'
       }));
+        }
+      }
     }
 
-    // Combine results and remove duplicates (in case a prospect appears in both)
+    // Combine results and remove duplicates
     const allContactsMap = new Map();
     
     // Add ProjectContact-based prospects
@@ -2009,27 +3410,139 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       allContactsMap.set(contact._id.toString(), contact);
     });
     
-    // Add activity-based prospects (only if not already present)
+    // Add activity-based prospects (only if not already present and on first page)
+    if (page === 1) {
     additionalProspects.forEach(contact => {
       if (!allContactsMap.has(contact._id.toString())) {
         allContactsMap.set(contact._id.toString(), contact);
       }
     });
+    }
 
-    // Convert map to array and sort
-    const allContacts = Array.from(allContactsMap.values()).sort((a, b) => {
-      // Sort by _id descending (newest first)
-      // Handle both ObjectId and string _id
-      const aId = a._id instanceof mongoose.Types.ObjectId ? a._id : new mongoose.Types.ObjectId(a._id);
-      const bId = b._id instanceof mongoose.Types.ObjectId ? b._id : new mongoose.Types.ObjectId(b._id);
-      return bId.getTimestamp() - aId.getTimestamp();
+    // Convert map to array - already sorted by pipeline
+    let paginatedContacts = Array.from(allContactsMap.values());
+    
+    // Remove duplicates based on identifying information (email, name+company, or name)
+    // Keep the contact with the most recent activity
+    const duplicateGroups = new Map(); // key: identifier, value: array of contacts
+    
+    // Group contacts by identifying information
+    paginatedContacts.forEach(contact => {
+      const email = (contact.email || '').trim().toLowerCase();
+      const name = (contact.name || '').trim().toLowerCase();
+      const company = (contact.company || '').trim().toLowerCase();
+      
+      // Create identifier: prefer email, then name+company, then name
+      let identifier = null;
+      if (email && email !== '') {
+        identifier = `email:${email}`;
+      } else if (name && name !== '' && company && company !== '') {
+        identifier = `name+company:${name}|${company}`;
+      } else if (name && name !== '') {
+        identifier = `name:${name}`;
+      }
+      
+      if (identifier) {
+        if (!duplicateGroups.has(identifier)) {
+          duplicateGroups.set(identifier, []);
+        }
+        duplicateGroups.get(identifier).push(contact);
+      }
     });
-
-    // Apply pagination to combined results
-    const paginatedContacts = allContacts.slice(skip, skip + limit);
-    // Total includes both ProjectContact entries and activity-based prospects
-    const total = allContacts.length;
-    const totalPages = Math.ceil(total / limit);
+    
+    // For each duplicate group, find the contact with the most recent activity
+    const contactsToRemove = new Set();
+    
+    // Process duplicate groups in batches to avoid too many queries
+    const duplicateGroupsArray = Array.from(duplicateGroups.entries()).filter(([_, contacts]) => contacts.length > 1);
+    
+    if (duplicateGroupsArray.length > 0) {
+      // Collect all contact IDs that might be duplicates
+      const allDuplicateContactIds = [];
+      duplicateGroupsArray.forEach(([_, contacts]) => {
+        contacts.forEach(contact => {
+          const contactId = contact._id?.toString ? contact._id.toString() : String(contact._id);
+          if (contactId && mongoose.Types.ObjectId.isValid(contactId)) {
+            allDuplicateContactIds.push(new mongoose.Types.ObjectId(contactId));
+          }
+        });
+      });
+      
+      if (allDuplicateContactIds.length > 0) {
+        // Get the most recent activity for each contact in one query
+        const mostRecentActivities = await Activity.aggregate([
+          {
+            $match: {
+              projectId: projectObjectId,
+              contactId: { $in: allDuplicateContactIds }
+            }
+          },
+          {
+            $group: {
+              _id: '$contactId',
+              mostRecentActivityDate: { $max: '$createdAt' }
+            }
+          }
+        ]);
+        
+        // Create a map of contactId -> most recent activity date
+        const activityDateMap = new Map();
+        mostRecentActivities.forEach(activity => {
+          if (activity._id) {
+            activityDateMap.set(activity._id.toString(), activity.mostRecentActivityDate);
+          }
+        });
+        
+        // For each duplicate group, find the contact with the most recent activity
+        for (const [identifier, contacts] of duplicateGroupsArray) {
+          let contactToKeep = null;
+          let mostRecentDate = null;
+          
+          contacts.forEach(contact => {
+            const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+            const activityDate = activityDateMap.get(contactIdStr);
+            
+            if (activityDate) {
+              // Has activity - prefer this one
+              if (!mostRecentDate || activityDate > mostRecentDate) {
+                mostRecentDate = activityDate;
+                contactToKeep = contact;
+              }
+            } else if (!contactToKeep) {
+              // No activity found yet, use this as fallback (prefer ProjectContact entries)
+              if (!contactToKeep || contact.projectContactId) {
+                contactToKeep = contact;
+              }
+            }
+          });
+          
+          // If no contact has activity, keep the first one (or one with projectContactId)
+          if (!contactToKeep) {
+            contactToKeep = contacts.find(c => c.projectContactId) || contacts[0];
+          }
+          
+          // Mark other contacts in the group for removal
+          const contactToKeepId = contactToKeep._id?.toString ? contactToKeep._id.toString() : String(contactToKeep._id);
+          contacts.forEach(contact => {
+            const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+            if (contactIdStr !== contactToKeepId) {
+              contactsToRemove.add(contactIdStr);
+            }
+          });
+        }
+      }
+    }
+    
+    // Filter out duplicates, keeping only the ones with most recent activity
+    paginatedContacts = paginatedContacts.filter(contact => {
+      const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
+      // Keep if it's not marked for removal
+      return !contactsToRemove.has(contactIdStr);
+    });
+    
+    // Update total count to reflect deduplicated results
+    const deduplicatedTotal = total - contactsToRemove.size;
+    const deduplicatedTotalPages = Math.ceil(deduplicatedTotal / limit);
 
     res.json({
       success: true,
@@ -2037,8 +3550,8 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       pagination: {
         page,
         limit,
-        total,
-        totalPages
+        total: deduplicatedTotal,
+        totalPages: deduplicatedTotalPages
       }
     });
   } catch (error) {
@@ -2466,19 +3979,25 @@ router.put('/:id', authenticate, async (req, res) => {
       channels,
       icpDefinition,
       assignedTo,
-      teamAllocation,
+      teamMembers,
       status
     } = req.body;
 
-    const project = await Project.findOne({
-      _id: projectId,
-      createdBy: req.user._id
-    });
+    const user = req.user;
+    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    
+    // Check if user has access (creator or admin)
+    let projectFilter = { _id: projectId };
+    if (!isAdmin) {
+      projectFilter.createdBy = user._id; // Only creator can edit
+    }
+    
+    const project = await Project.findOne(projectFilter);
 
     if (!project) {
       return res.status(404).json({
         success: false,
-        error: 'Project not found'
+        error: 'Project not found or access denied'
       });
     }
 
@@ -2502,6 +4021,11 @@ router.put('/:id', authenticate, async (req, res) => {
     if (companySize !== undefined) updateData.companySize = companySize;
     if (companyDescription !== undefined) updateData.companyDescription = companyDescription;
     if (assignedTo !== undefined) updateData.assignedTo = assignedTo;
+    if (teamMembers !== undefined) {
+      updateData.teamMembers = Array.isArray(teamMembers) 
+        ? teamMembers.filter(email => email && email.trim()).map(email => email.toLowerCase().trim())
+        : [];
+    }
     if (status) updateData.status = status;
 
     if (contactPerson) {
@@ -3403,33 +4927,12 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
               return; // Skip empty rows silently
             }
 
-            // Validate required fields - ONLY use actual data from the file, no defaults
-            const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.toString().trim()) ? personLinkedinUrl.toString().trim() : '';
-            if (!trimmedPersonLinkedinUrl) {
-              // Log available columns for debugging (only for first few errors to avoid spam)
-              if (errors.length < 3) {
-                console.log('=== EXCEL ROW DEBUG ===');
-                console.log('Row number:', rowNumber + 1);
-                console.log('Available Excel columns:', Object.keys(row));
-                console.log('Full row data:', row);
-                console.log('Normalized row keys:', Object.keys(normalizedRow));
-                console.log('Extracted values:', {
-                  name: name || '(empty)',
-                  email: email || '(empty)',
-                  company: company || '(empty)',
-                  personLinkedinUrl: personLinkedinUrl || '(empty)'
-                });
-                console.log('======================');
-              }
-              errors.push(`Row ${rowNumber + 1}: Person Linkedin Url is required`);
-              return; // Skip this row
-            }
-
             // ONLY use actual data from the file - NO default values
             // If a field is missing in the Excel file, it should remain empty, not be filled with defaults
             const trimmedName = (name && name.toString().trim()) ? name.toString().trim() : '';
             const trimmedEmail = (email && email.toString().trim()) ? email.toString().trim().toLowerCase() : '';
             const trimmedCompany = (company && company.toString().trim()) ? company.toString().trim() : '';
+            const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.toString().trim()) ? personLinkedinUrl.toString().trim() : '';
             
             // Validate that we have at least name or company (required fields)
             if (!trimmedName && !trimmedCompany) {
@@ -3789,22 +5292,16 @@ router.post('/bulk-import', authenticate, upload.single('file'), async (req, res
             continue; // Skip empty rows
           }
 
-          // Validate required fields
-          const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.trim()) ? personLinkedinUrl.trim() : '';
-          if (!trimmedPersonLinkedinUrl) {
-            errors.push(`Row ${rowNumber}: Person Linkedin Url is required`);
-            continue; // Skip this row
-          }
-
           // ONLY use actual data from the file - NO default values
           // If a field is missing in the CSV file, it should remain empty, not be filled with defaults
           const trimmedName = (name && name.toString().trim()) ? name.toString().trim() : '';
           const trimmedEmail = (email && email.toString().trim()) ? email.toString().trim().toLowerCase() : '';
           const trimmedCompany = (company && company.toString().trim()) ? company.toString().trim() : '';
+          const trimmedPersonLinkedinUrl = (personLinkedinUrl && personLinkedinUrl.trim()) ? personLinkedinUrl.trim() : '';
           
           // Validate that we have at least name or company (required fields)
           if (!trimmedName && !trimmedCompany) {
-            errors.push(`Row ${i + 1}: Name or Company is required`);
+            errors.push(`Row ${rowNumber}: Name or Company is required`);
             continue; // Skip this row
           }
 
