@@ -245,7 +245,7 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
       }
     }
     
-    const limit = parseInt(req.query.limit) || 1000; // Default limit to improve performance
+    const limit = Math.min(parseInt(req.query.limit) || 1000, 5000); // Default limit to 1000, max 5000 for performance
     let activityFilter = { projectId: req.params.projectId };
     
     // For team members, show all activities in the project

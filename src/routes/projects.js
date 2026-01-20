@@ -775,21 +775,21 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         { $match: projectFilter },
         { $group: { _id: '$stage', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
-      ]),
+      ]).allowDiskUse(true),
       
       // Prospects by priority
       ProjectContact.aggregate([
         { $match: projectFilter },
         { $group: { _id: '$priority', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
-      ]),
+      ]).allowDiskUse(true),
       
       // Activities by type
       Activity.aggregate([
         { $match: projectFilter },
         { $group: { _id: '$type', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
-      ]),
+      ]).allowDiskUse(true),
       
       // Activities by date (last 30 days)
       Activity.aggregate([
@@ -910,7 +910,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         {
           $sort: { createdAt: -1 }
         }
-      ]),
+      ]).allowDiskUse(true),
       
       // Email Funnel
       Activity.aggregate([
@@ -928,7 +928,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
             outcome: { $last: '$outcome' }
           }
         }
-      ]),
+      ]).allowDiskUse(true),
       
       // LinkedIn Funnel - get most recent activity per contact
       Activity.aggregate([
@@ -955,7 +955,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
             createdAt: { $first: '$createdAt' }
           }
         }
-      ]),
+      ]).allowDiskUse(true),
       
       // Recent activities
       // Check both ProspectContact and Contact collections for legacy data
@@ -2276,6 +2276,62 @@ router.get('/', authenticate, async (req, res) => {
         }
       },
       {
+        $lookup: {
+          from: 'activities',
+          let: { projectId: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $and: [
+                  {
+                    $expr: {
+                      $eq: ['$projectId', '$$projectId']
+                    }
+                  },
+                  { contactId: { $ne: null } },
+                  { contactId: { $exists: true } }
+                ]
+              }
+            },
+            {
+              $project: {
+                contactId: 1,
+                type: 1,
+                callStatus: 1,
+                status: 1,
+                activityStatus: {
+                  $cond: {
+                    if: { $eq: ['$type', 'call'] },
+                    then: '$callStatus',
+                    else: '$status'
+                  }
+                }
+              }
+            },
+            {
+              $match: {
+                activityStatus: { $ne: null, $ne: '' }
+              }
+            },
+            {
+              $group: {
+                _id: {
+                  status: '$activityStatus',
+                  contactId: '$contactId'
+                }
+              }
+            },
+            {
+              $group: {
+                _id: '$_id.status',
+                count: { $sum: 1 }
+              }
+            }
+          ],
+          as: 'leadsByActivityStatus'
+        }
+      },
+      {
         $project: {
           _id: 1,
           companyName: 1,
@@ -2340,20 +2396,32 @@ router.get('/', authenticate, async (req, res) => {
                       }
                     }
                   }
+                },
+                activityStatusMap: {
+                  $arrayToObject: {
+                    $map: {
+                      input: '$leadsByActivityStatus',
+                      as: 'lead',
+                      in: {
+                        k: { $ifNull: ['$$lead._id', ''] },
+                        v: '$$lead.count'
+                      }
+                    }
+                  }
                 }
               },
               in: {
                 new: { $ifNull: ['$$stageMap.New', 0] },
-                interested: { $ifNull: ['$$stageMap.Interested', 0] },
-                cip: { $ifNull: ['$$stageMap.CIP', 0] },
-                detailsShared: { $ifNull: ['$$stageMap.Details Shared', 0] },
-                demoBooked: { $ifNull: ['$$stageMap.Demo Booked', 0] },
-                demoCompleted: { $ifNull: ['$$stageMap.Demo Completed', 0] },
-                sql: { $ifNull: ['$$stageMap.SQL', 0] },
-                won: { $ifNull: ['$$stageMap.WON', 0] },
-                meetingProposed: { $ifNull: ['$$stageMap.Meeting Proposed', 0] },
-                meetingScheduled: { $ifNull: ['$$stageMap.Meeting Scheduled', 0] },
-                meetingCompleted: { $ifNull: ['$$stageMap.Meeting Completed', 0] }
+                interested: { $ifNull: ['$$activityStatusMap.Interested', 0] },
+                cip: { $ifNull: ['$$activityStatusMap.CIP', 0] },
+                detailsShared: { $ifNull: ['$$activityStatusMap.Details Shared', 0] },
+                demoBooked: { $ifNull: ['$$activityStatusMap.Demo Booked', 0] },
+                demoCompleted: { $ifNull: ['$$activityStatusMap.Demo Completed', 0] },
+                sql: { $ifNull: ['$$activityStatusMap.SQL', 0] },
+                won: { $ifNull: ['$$activityStatusMap.WON', 0] },
+                meetingProposed: { $ifNull: ['$$activityStatusMap.Meeting Proposed', 0] },
+                meetingScheduled: { $ifNull: ['$$activityStatusMap.Meeting Scheduled', 0] },
+                meetingCompleted: { $ifNull: ['$$activityStatusMap.Meeting Completed', 0] }
               }
             }
           },
@@ -2603,9 +2671,11 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
       activityFilter.createdBy = user._id;
     }
 
-    // Get all activities for this project
+    // Get all activities for this project - use select to only fetch needed fields
     const Activity = require('../models/Activity');
-    const activities = await Activity.find(activityFilter).lean();
+    const activities = await Activity.find(activityFilter)
+      .select('type callStatus status contactId callDate emailDate linkedinDate createdAt createdBy lnRequestSent connected')
+      .lean();
 
     // Calculate Call KPIs and Funnel Stages
     const callActivities = activities.filter(a => a.type === 'call');
@@ -3080,9 +3150,8 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
   try {
     const projectId = req.params.id;
     const page = parseInt(req.query.page) || 1;
-    // Increased limit to 10000 to handle large prospect lists
-    // If no limit is specified, fetch all prospects (set to a high number)
-    const limit = parseInt(req.query.limit) || 10000;
+    // Default limit to 50 for better performance - can be increased if needed
+    const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
     const search = req.query.search ? req.query.search.trim() : null;
 
@@ -3117,13 +3186,16 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       });
     }
 
-    // Optimized aggregation pipeline
-    // If searching, lookup contacts first, filter, then paginate
-    // If not searching, we can optimize by paginating early
+    // Optimized aggregation pipeline using $facet to get count and data in one query
+    // This reduces database round trips and improves performance
     const pipeline = [
       // Match project contacts - use index
       {
         $match: { projectId: projectObjectId }
+      },
+      // Sort early for consistent pagination (before expensive lookups)
+      {
+        $sort: { createdAt: -1 }
       },
       // Lookup prospect contacts (needed for search filtering)
       {
@@ -3163,12 +3235,8 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       // Filter out entries where neither contact was found
       {
         $match: {
-          contact: { $ne: null }
-        }
-      },
-      // Filter out default/test prospects (no email AND no phone)
-      {
-        $match: {
+          contact: { $ne: null },
+          // Filter out default/test prospects (no email AND no phone)
           $or: [
             { 'contact.email': { $exists: true, $ne: '', $ne: null } },
             { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
@@ -3186,135 +3254,79 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           ]
         }
       }] : []),
-      // Sort for consistent pagination
+      // Use $facet to get both count and data in one query
       {
-        $sort: { createdAt: -1 }
-      },
-      // Apply pagination AFTER filtering (so search works across all contacts)
-      {
-        $skip: skip
-      },
-      {
-        $limit: limit
-      },
-      // Project only needed fields
-      {
-        $project: {
-          _id: '$contact._id',
-          name: '$contact.name',
-          title: '$contact.title',
-          company: '$contact.company',
-          email: '$contact.email',
-          firstPhone: '$contact.firstPhone',
-          category: '$contact.category',
-          industry: '$contact.industry',
-          keywords: '$contact.keywords',
-          city: '$contact.city',
-          state: '$contact.state',
-          country: '$contact.country',
-          companyCity: '$contact.companyCity',
-          companyState: '$contact.companyState',
-          companyCountry: '$contact.companyCountry',
-          personLinkedinUrl: '$contact.personLinkedinUrl',
-          companyLinkedinUrl: '$contact.companyLinkedinUrl',
-          website: '$contact.website',
-          employees: '$contact.employees',
-          projectContactId: '$projectContactId',
-          stage: { $ifNull: ['$stage', 'New'] },
-          assignedTo: { $ifNull: ['$assignedTo', ''] },
-          priority: { $ifNull: ['$priority', 'Medium'] },
-          isImported: { $literal: true },
-          matchType: { $literal: 'imported' }
+        $facet: {
+          total: [{ $count: 'count' }],
+          data: [
+            // Apply pagination
+            { $skip: skip },
+            { $limit: limit },
+            // Project only needed fields
+            {
+              $project: {
+                _id: '$contact._id',
+                name: '$contact.name',
+                title: '$contact.title',
+                company: '$contact.company',
+                email: '$contact.email',
+                firstPhone: '$contact.firstPhone',
+                category: '$contact.category',
+                industry: '$contact.industry',
+                keywords: '$contact.keywords',
+                city: '$contact.city',
+                state: '$contact.state',
+                country: '$contact.country',
+                companyCity: '$contact.companyCity',
+                companyState: '$contact.companyState',
+                companyCountry: '$contact.companyCountry',
+                personLinkedinUrl: '$contact.personLinkedinUrl',
+                companyLinkedinUrl: '$contact.companyLinkedinUrl',
+                website: '$contact.website',
+                employees: '$contact.employees',
+                projectContactId: '$projectContactId',
+                stage: { $ifNull: ['$stage', 'New'] },
+                assignedTo: { $ifNull: ['$assignedTo', ''] },
+                priority: { $ifNull: ['$priority', 'Medium'] },
+                isImported: { $literal: true },
+                matchType: { $literal: 'imported' }
+              }
+            }
+          ]
         }
       }
     ];
 
-    // Get total count for pagination (checking both collections)
-    // Must include search filter in count pipeline to get accurate total
-    const countPipeline = [
-      { $match: { projectId: projectObjectId } },
-      {
-        $lookup: {
-          from: 'prospectcontacts',
-          localField: 'contactId',
-          foreignField: '_id',
-          as: 'prospectContact'
-        }
-      },
-      {
-        $lookup: {
-          from: 'contacts',
-          localField: 'contactId',
-          foreignField: '_id',
-          as: 'legacyContact'
-        }
-      },
-      {
-        $project: {
-          contact: {
-            $cond: {
-              if: { $gt: [{ $size: '$prospectContact' }, 0] },
-              then: { $arrayElemAt: ['$prospectContact', 0] },
-              else: { $arrayElemAt: ['$legacyContact', 0] }
-            }
-          }
-        }
-      },
-      {
-        $match: {
-          contact: { $ne: null },
-          // Filter out default/test prospects (no email AND no phone)
-          $or: [
-            { 'contact.email': { $exists: true, $ne: '', $ne: null } },
-            { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
-          ]
-        }
-      },
-      // Apply search filter if provided (same as main pipeline)
-      ...(search ? [{
-        $match: {
-          $or: [
-            { 'contact.name': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
-            { 'contact.company': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
-            { 'contact.email': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
-            { 'contact.firstPhone': { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } }
-          ]
-        }
-      }] : []),
-      { $count: 'total' }
-    ];
+    // Execute single optimized query with $facet
+    const [result] = await ProjectContact.aggregate(pipeline).allowDiskUse(true);
+    
+    // Extract data and count from facet result
+    const contactsResult = result?.data || [];
+    const total = result?.total?.[0]?.count || 0;
 
-    // Execute queries in parallel - optimized for performance
-    // Only fetch activity-based contacts on first page to avoid performance issues
-    const [contactsResult, countResult] = await Promise.all([
-      ProjectContact.aggregate(pipeline),
-      ProjectContact.aggregate(countPipeline)
-    ]);
-
-    // Get total count from count pipeline
-    const total = countResult.length > 0 ? countResult[0].total : 0;
     const totalPages = Math.ceil(total / limit);
 
     // Only fetch activity-based prospects on first page to improve performance
     // For subsequent pages, only show ProjectContact-based prospects
+    // Limit activity-based prospects to avoid performance issues
     let additionalProspects = [];
-    if (page === 1) {
+    if (page === 1 && limit <= 100) {
       // Get prospects that have activities for this project but no ProjectContact entry
-      // Limit this query to avoid performance issues
-    const activitiesWithContacts = await Activity.aggregate([
-      {
-        $match: {
-          projectId: projectObjectId,
-          contactId: { $ne: null, $exists: true }
-        }
-      },
-      {
-        $group: {
-          _id: '$contactId'
-        }
+      // Only fetch if limit is reasonable (<= 100) to avoid performance issues
+      const activitiesWithContacts = await Activity.aggregate([
+        {
+          $match: {
+            projectId: projectObjectId,
+            contactId: { $ne: null, $exists: true }
+          }
         },
-        { $limit: 100 } // Limit to first 100 to avoid performance issues
-    ]);
+        {
+          $group: {
+            _id: '$contactId'
+          }
+        },
+        { $limit: 50 } // Limit to first 50 to avoid performance issues
+      ]).allowDiskUse(true);
 
     const activityContactIds = activitiesWithContacts.map(a => a._id).filter(id => id != null);
     
