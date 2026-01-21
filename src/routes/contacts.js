@@ -1423,19 +1423,34 @@ router.get('/:id', async (req, res) => {
 });
 
 // Update contact
+// Note: Contacts can live in either ProspectContact (project contacts) or Contact (databank)
 router.put('/:id', authenticate, async (req, res) => {
   try {
-    const contact = await Contact.findByIdAndUpdate(
+    const updateOptions = { new: true, runValidators: true };
+
+    // Try updating a project/prospect contact first
+    let contact = await ProspectContact.findByIdAndUpdate(
       req.params.id,
       req.body,
-      { new: true, runValidators: true }
+      updateOptions
     );
+
+    // If not found there, fall back to the main Contact collection
+    if (!contact) {
+      contact = await Contact.findByIdAndUpdate(
+        req.params.id,
+        req.body,
+        updateOptions
+      );
+    }
+
     if (!contact) {
       return res.status(404).json({
         success: false,
         error: 'Contact not found'
       });
     }
+
     res.json({
       success: true,
       data: contact
