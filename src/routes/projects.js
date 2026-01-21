@@ -2694,7 +2694,7 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     // Get all activities for this project - use select to only fetch needed fields
     const Activity = require('../models/Activity');
     const activities = await Activity.find(activityFilter)
-      .select('type callStatus status contactId callDate emailDate linkedinDate createdAt createdBy lnRequestSent connected')
+      .select('type template callStatus status contactId callDate emailDate linkedinDate createdAt createdBy lnRequestSent connected')
       .lean();
 
     // Calculate Call KPIs and Funnel Stages
@@ -2927,6 +2927,14 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
       .map(a => a.contactId?.toString())
       .filter(Boolean)
     ).size;
+    const notInterested = new Set(callActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Not Interested';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
     const detailsShared = new Set(callActivities
       .filter(a => {
         const contactIdStr = a.contactId?.toString();
@@ -2947,6 +2955,53 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
       .filter(a => {
         const contactIdStr = a.contactId?.toString();
         return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Demo Completed';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+    
+    // Follow-up metrics based on nextActionDate for call activities
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const dayAfterTomorrow = new Date(tomorrow);
+    dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
+
+    const todayFollowups = new Set(callActivities
+      .filter(a => {
+        if (!a.nextActionDate) return false;
+        const contactIdStr = a.contactId?.toString();
+        if (!contactIdStr || !validContactIds.has(contactIdStr)) return false;
+        const actionDate = new Date(a.nextActionDate);
+        actionDate.setHours(0, 0, 0, 0);
+        return actionDate >= today && actionDate < tomorrow;
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+
+    const tomorrowFollowups = new Set(callActivities
+      .filter(a => {
+        if (!a.nextActionDate) return false;
+        const contactIdStr = a.contactId?.toString();
+        if (!contactIdStr || !validContactIds.has(contactIdStr)) return false;
+        const actionDate = new Date(a.nextActionDate);
+        actionDate.setHours(0, 0, 0, 0);
+        return actionDate >= tomorrow && actionDate < dayAfterTomorrow;
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+
+    const missedFollowups = new Set(callActivities
+      .filter(a => {
+        if (!a.nextActionDate) return false;
+        const contactIdStr = a.contactId?.toString();
+        if (!contactIdStr || !validContactIds.has(contactIdStr)) return false;
+        const actionDate = new Date(a.nextActionDate);
+        actionDate.setHours(0, 0, 0, 0);
+        return actionDate < today;
       })
       .map(a => a.contactId?.toString())
       .filter(Boolean)
@@ -3089,9 +3144,53 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     // Calculate Email KPIs
     const emailActivities = activities.filter(a => a.type === 'email');
     const emailsSent = emailActivities.length;
-    const emailOpens = emailActivities.filter(a => 
+    
+    // Accepted: emails that were opened (not bounced, opt-out, or no reply)
+    const emailAccepted = emailActivities.filter(a => 
       a.status && a.status !== 'Bounce' && a.status !== 'Opt-Out' && a.status !== 'No Reply'
     ).length;
+    
+    // Followups: contacts with more than 1 email activity
+    const emailActivityCounts = new Map();
+    emailActivities.forEach(a => {
+      if (a.contactId) {
+        const contactIdStr = a.contactId.toString();
+        emailActivityCounts.set(contactIdStr, (emailActivityCounts.get(contactIdStr) || 0) + 1);
+      }
+    });
+    const emailFollowups = Array.from(emailActivityCounts.values()).filter(count => count > 1).length;
+    
+    // CIP: Conversations in Progress
+    const emailCip = emailActivities.filter(a => 
+      a.status && (a.status === 'CIP' || a.status === 'Conversations in Progress')
+    ).length;
+    
+    // Meeting Proposed
+    const emailMeetingProposed = emailActivities.filter(a => a.status === 'Meeting Proposed').length;
+    
+    // Scheduled
+    const emailScheduled = emailActivities.filter(a => a.status === 'Meeting Scheduled').length;
+    
+    // Completed
+    const emailCompleted = emailActivities.filter(a => a.status === 'Meeting Completed').length;
+    
+    // SQL: contacts with SQL stage
+    const emailContactIds = new Set(emailActivities
+      .filter(a => a.contactId)
+      .map(a => a.contactId.toString())
+      .filter(Boolean)
+    );
+    const emailSqlContacts = await ProjectContact.countDocuments({
+      projectId: projectObjectId,
+      contactId: { $in: Array.from(emailContactIds).map(id => new mongoose.Types.ObjectId(id)) },
+      stage: 'SQL'
+    });
+    
+    // Email bounce
+    const emailBounce = emailActivities.filter(a => a.status === 'Bounce').length;
+    
+    // Legacy metrics (for backward compatibility)
+    const emailOpens = emailAccepted;
     const emailOpenRate = emailsSent > 0 
       ? ((emailOpens / emailsSent) * 100).toFixed(1) 
       : '0.0';
@@ -3140,14 +3239,27 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
           callsConnected,
           decisionMakerReached,
           interested,
+          notInterested,
           detailsShared,
           demoBooked,
           demoCompleted,
           sql: sqlContacts,
-          won: wonContacts
+          won: wonContacts,
+          todayFollowups,
+          tomorrowFollowups,
+          missedFollowups
         },
         email: {
           emailsSent,
+          accepted: emailAccepted,
+          followups: emailFollowups,
+          cip: emailCip,
+          meetingProposed: emailMeetingProposed,
+          scheduled: emailScheduled,
+          completed: emailCompleted,
+          sql: emailSqlContacts,
+          emailBounce,
+          // Legacy metrics (for backward compatibility)
           emailOpens,
           emailOpenRate: parseFloat(emailOpenRate),
           emailReplies,

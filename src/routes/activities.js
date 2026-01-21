@@ -264,7 +264,7 @@ router.get('/project/:projectId', authenticate, async (req, res) => {
     }
     
     const activities = await Activity.find(activityFilter)
-      .select('projectId contactId type outcome conversationNotes nextAction nextActionDate status createdAt lnRequestSent connected linkedInAccountName callNumber callStatus callDate emailDate linkedinDate createdBy')
+      .select('projectId contactId type template outcome conversationNotes nextAction nextActionDate status createdAt lnRequestSent connected linkedInAccountName callNumber callStatus callDate emailDate linkedinDate createdBy')
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
