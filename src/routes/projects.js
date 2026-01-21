@@ -4211,10 +4211,6 @@ router.put('/:id', authenticate, async (req, res) => {
       };
     }
 
-    if (teamAllocation) {
-      updateData.teamAllocation = { ...project.teamAllocation, ...teamAllocation };
-    }
-
     Object.assign(project, updateData);
     await project.save();
 
