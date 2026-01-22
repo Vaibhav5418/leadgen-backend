@@ -808,32 +808,106 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         { $sort: { _id: 1 } }
       ]),
       
-      // Team performance
-      Activity.aggregate([
-        { $match: projectFilter },
-        {
-          $lookup: {
-            from: 'users',
-            localField: 'createdBy',
-            foreignField: '_id',
-            as: 'user'
+      // Team performance - Include both team members from projects AND those with activities
+      (async () => {
+        // Get all projects matching the filter
+        const projects = await Project.find(
+          projectId && mongoose.Types.ObjectId.isValid(projectId)
+            ? { _id: new mongoose.Types.ObjectId(projectId) }
+            : projectIds.length > 0 ? { _id: { $in: projectIds } } : {}
+        ).select('teamMembers assignedTo').lean();
+        
+        // Collect all unique team member emails from projects
+        const teamMemberEmails = new Set();
+        projects.forEach(project => {
+          if (project.teamMembers && Array.isArray(project.teamMembers)) {
+            project.teamMembers.forEach(email => {
+              if (email && email.trim()) {
+                teamMemberEmails.add(email.toLowerCase().trim());
+              }
+            });
           }
-        },
-        { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
-        {
-          $group: {
-            _id: '$createdBy',
-            name: { $first: '$user.name' },
-            email: { $first: '$user.email' },
-            activityCount: { $sum: 1 },
-            calls: { $sum: { $cond: [{ $eq: ['$type', 'call'] }, 1, 0] } },
-            emails: { $sum: { $cond: [{ $eq: ['$type', 'email'] }, 1, 0] } },
-            linkedin: { $sum: { $cond: [{ $eq: ['$type', 'linkedin'] }, 1, 0] } }
+          if (project.assignedTo && project.assignedTo.trim()) {
+            teamMemberEmails.add(project.assignedTo.toLowerCase().trim());
           }
-        },
-        { $sort: { activityCount: -1 } },
-        { $limit: 10 }
-      ]),
+        });
+        
+        // Get activity metrics for users who have created activities
+        const activityBasedMembers = await Activity.aggregate([
+          { $match: projectFilter },
+          {
+            $lookup: {
+              from: 'users',
+              localField: 'createdBy',
+              foreignField: '_id',
+              as: 'user'
+            }
+          },
+          { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+          {
+            $group: {
+              _id: '$createdBy',
+              name: { $first: '$user.name' },
+              email: { $first: '$user.email' },
+              activityCount: { $sum: 1 },
+              calls: { $sum: { $cond: [{ $eq: ['$type', 'call'] }, 1, 0] } },
+              emails: { $sum: { $cond: [{ $eq: ['$type', 'email'] }, 1, 0] } },
+              linkedin: { $sum: { $cond: [{ $eq: ['$type', 'linkedin'] }, 1, 0] } }
+            }
+          }
+        ]);
+        
+        // Add emails from activity-based members to the set
+        activityBasedMembers.forEach(member => {
+          if (member.email) {
+            teamMemberEmails.add(member.email.toLowerCase().trim());
+          }
+        });
+        
+        // Get user details for ALL team members (from projects + activities)
+        const allTeamMemberUsers = await User.find({
+          email: { $in: Array.from(teamMemberEmails) }
+        }).select('_id name email').lean();
+        
+        // Create a map of activity metrics by user ID
+        const activityMap = new Map();
+        activityBasedMembers.forEach(member => {
+          if (member._id) {
+            activityMap.set(member._id.toString(), {
+              activityCount: member.activityCount || 0,
+              calls: member.calls || 0,
+              emails: member.emails || 0,
+              linkedin: member.linkedin || 0
+            });
+          }
+        });
+        
+        // Merge all team members (from projects + activities) with their activity metrics
+        const allTeamMembers = allTeamMemberUsers.map(user => {
+          const userId = user._id.toString();
+          const activities = activityMap.get(userId) || {
+            activityCount: 0,
+            calls: 0,
+            emails: 0,
+            linkedin: 0
+          };
+          
+          return {
+            _id: user._id,
+            name: user.name || 'Unknown',
+            email: user.email || '',
+            activityCount: activities.activityCount,
+            calls: activities.calls,
+            emails: activities.emails,
+            linkedin: activities.linkedin
+          };
+        });
+        
+        // Sort by activity count descending and limit to top 10
+        return allTeamMembers
+          .sort((a, b) => b.activityCount - a.activityCount)
+          .slice(0, 10);
+      })(),
       
       // Stage distribution with details
       // Check both ProspectContact and Contact collections for legacy data
@@ -1641,18 +1715,46 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
       }
       projectFilter.projectId = projectObjectId;
     } else if (!isAdmin) {
-      const projects = await Project.find({
+      const userProjects = await Project.find({
         $or: [
           { createdBy: user._id },
           { teamMembers: { $in: [user.email.toLowerCase()] } }
         ]
       }).lean();
-      const projectIds = projects.map(p => p._id);
+      const projectIds = userProjects.map(p => p._id);
       projectFilter.projectId = { $in: projectIds };
     }
     
-    // Get all team members who have activities
-    const teamMembers = await Activity.aggregate([
+    // Get all team members from projects AND those who have created activities
+    let projectQuery = {};
+    if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+      projectQuery = { _id: new mongoose.Types.ObjectId(projectId) };
+    } else if (projectFilter.projectId) {
+      if (projectFilter.projectId.$in) {
+        projectQuery = { _id: { $in: projectFilter.projectId.$in } };
+      } else {
+        projectQuery = { _id: projectFilter.projectId };
+      }
+    }
+    const projectsForTeamMembers = await Project.find(projectQuery).select('teamMembers assignedTo').lean();
+    
+    // Collect all unique team member emails from projects
+    const teamMemberEmails = new Set();
+    projectsForTeamMembers.forEach(project => {
+      if (project.teamMembers && Array.isArray(project.teamMembers)) {
+        project.teamMembers.forEach(email => {
+          if (email && email.trim()) {
+            teamMemberEmails.add(email.toLowerCase().trim());
+          }
+        });
+      }
+      if (project.assignedTo && project.assignedTo.trim()) {
+        teamMemberEmails.add(project.assignedTo.toLowerCase().trim());
+      }
+    });
+    
+    // Also get team members who have created activities (even if not in teamMembers array)
+    const activityBasedMembers = await Activity.aggregate([
       { $match: projectFilter },
       {
         $lookup: {
@@ -1666,12 +1768,29 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
       {
         $group: {
           _id: '$createdBy',
-          name: { $first: '$user.name' },
           email: { $first: '$user.email' }
         }
-      },
-      { $sort: { name: 1 } }
+      }
     ]);
+    
+    // Add emails from activity-based members to the set
+    activityBasedMembers.forEach(member => {
+      if (member.email) {
+        teamMemberEmails.add(member.email.toLowerCase().trim());
+      }
+    });
+    
+    // Get user details for ALL team members (from projects + activities)
+    const allTeamMemberUsers = await User.find({
+      email: { $in: Array.from(teamMemberEmails) }
+    }).select('_id name email').lean();
+    
+    // Map to the format expected by the rest of the code
+    const teamMembers = allTeamMemberUsers.map(user => ({
+      _id: user._id,
+      name: user.name || 'Unknown',
+      email: user.email || ''
+    })).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
     
     // Get total prospects for the project
     const totalProspects = await ProjectContact.countDocuments(projectFilter);
@@ -2694,7 +2813,7 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     // Get all activities for this project - use select to only fetch needed fields
     const Activity = require('../models/Activity');
     const activities = await Activity.find(activityFilter)
-      .select('type template callStatus status contactId callDate emailDate linkedinDate createdAt createdBy lnRequestSent connected')
+      .select('type template callStatus status contactId callDate emailDate linkedinDate createdAt createdBy lnRequestSent connected nextActionDate')
       .lean();
 
     // Calculate Call KPIs and Funnel Stages
@@ -2961,6 +3080,7 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     ).size;
     
     // Follow-up metrics based on nextActionDate for call activities
+    // Use one next action per contact (earliest nextActionDate) so each contact is counted at most once
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
@@ -2968,44 +3088,27 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     const dayAfterTomorrow = new Date(tomorrow);
     dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
 
-    const todayFollowups = new Set(callActivities
-      .filter(a => {
-        if (!a.nextActionDate) return false;
-        const contactIdStr = a.contactId?.toString();
-        if (!contactIdStr || !validContactIds.has(contactIdStr)) return false;
-        const actionDate = new Date(a.nextActionDate);
-        actionDate.setHours(0, 0, 0, 0);
-        return actionDate >= today && actionDate < tomorrow;
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
+    const earliestCallNextActionByContact = new Map();
+    callActivities.forEach(a => {
+      if (!a.nextActionDate) return;
+      const contactIdStr = a.contactId?.toString();
+      if (!contactIdStr || !validContactIds.has(contactIdStr)) return;
+      const actionDate = new Date(a.nextActionDate);
+      actionDate.setHours(0, 0, 0, 0);
+      const existing = earliestCallNextActionByContact.get(contactIdStr);
+      if (!existing || actionDate < existing) {
+        earliestCallNextActionByContact.set(contactIdStr, actionDate);
+      }
+    });
 
-    const tomorrowFollowups = new Set(callActivities
-      .filter(a => {
-        if (!a.nextActionDate) return false;
-        const contactIdStr = a.contactId?.toString();
-        if (!contactIdStr || !validContactIds.has(contactIdStr)) return false;
-        const actionDate = new Date(a.nextActionDate);
-        actionDate.setHours(0, 0, 0, 0);
-        return actionDate >= tomorrow && actionDate < dayAfterTomorrow;
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-
-    const missedFollowups = new Set(callActivities
-      .filter(a => {
-        if (!a.nextActionDate) return false;
-        const contactIdStr = a.contactId?.toString();
-        if (!contactIdStr || !validContactIds.has(contactIdStr)) return false;
-        const actionDate = new Date(a.nextActionDate);
-        actionDate.setHours(0, 0, 0, 0);
-        return actionDate < today;
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
+    let todayFollowups = 0;
+    let tomorrowFollowups = 0;
+    let missedFollowups = 0;
+    earliestCallNextActionByContact.forEach((actionDate) => {
+      if (actionDate >= today && actionDate < tomorrow) todayFollowups += 1;
+      else if (actionDate >= tomorrow && actionDate < dayAfterTomorrow) tomorrowFollowups += 1;
+      else if (actionDate < today) missedFollowups += 1;
+    });
     
     // Get SQL and WON from project contacts (stage field) for deduplicated contacts
     const sqlContacts = await ProjectContact.countDocuments({ 
