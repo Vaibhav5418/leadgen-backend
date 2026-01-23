@@ -66,6 +66,7 @@ app.use('/api/company-analysis', require('./routes/company-analysis'));
 app.use('/api/categories', require('./routes/categories'));
 app.use('/api/projects', require('./routes/projects'));
 app.use('/api/activities', require('./routes/activities'));
+app.use('/api/ai', require('./routes/ai'));
 
 // Detailed health check endpoint (includes database status)
 app.get('/api/health', (req, res) => {
