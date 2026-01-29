@@ -4560,9 +4560,9 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       {
         $match: { projectId: projectObjectId }
       },
-      // Sort early for consistent pagination (before expensive lookups)
+      // Sort early for consistent pagination (stable: createdAt then _id)
       {
-        $sort: { createdAt: -1 }
+        $sort: { createdAt: -1, _id: -1 }
       },
       // Lookup prospect contacts (needed for search filtering)
       {
@@ -4761,8 +4761,8 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           _lastActivityAt: { $arrayElemAt: ['$_lastActivity.createdAt', 0] }
         }
       },
-      // Sort so the "best" record per identifier comes first, then group.
-      { $sort: { _lastActivityAt: -1, createdAt: -1 } },
+      // Sort so the "best" record per identifier comes first (stable: _id tiebreaker), then group.
+      { $sort: { _lastActivityAt: -1, createdAt: -1, _id: -1 } },
       {
         $group: {
           _id: '$_identifier',
@@ -4775,7 +4775,8 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
         $facet: {
           total: [{ $count: 'count' }],
           data: [
-            // Apply pagination
+            // Stable sort before pagination so page N is deterministic
+            { $sort: { _lastActivityAt: -1, createdAt: -1, _id: -1 } },
             { $skip: skip },
             { $limit: limit },
             // Project only needed fields
