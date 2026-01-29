@@ -4,6 +4,7 @@ const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 const Contact = require('../models/Contact');
+const authenticate = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -243,7 +244,7 @@ function transformRow(row, columnMappingReport = null) {
 }
 
 // Import route
-router.post('/upload', upload.single('file'), async (req, res) => {
+router.post('/upload', authenticate, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -393,7 +394,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
           results.errors.push(`Row ${i + 2}: Skipped - ${duplicateCheck.reason} (${contactData.name || 'Unknown'})`);
         } else {
           // Insert new contact
-          await Contact.create(contactData);
+          await Contact.create({ ...contactData, createdBy: req.user?._id || null });
           results.inserted++;
         }
       } catch (error) {

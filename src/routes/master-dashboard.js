@@ -40,6 +40,7 @@ router.get('/', authenticate, async (req, res) => {
       dataQualityMetrics,
       linkedInMetrics,
       coldCallMetrics,
+      coldCallStatusBreakdownRows,
       emailMetrics,
       followUpMetrics,
       alerts
@@ -387,6 +388,23 @@ router.get('/', authenticate, async (req, res) => {
                 ]
               }
             }
+          }
+        }
+      ]),
+
+      // Cold Call status breakdown (for Call Status Distribution chart, same as Prospect Analytics)
+      Activity.aggregate([
+        { $match: { projectId: { $in: projectIds }, type: 'call' } },
+        {
+          $group: {
+            _id: {
+              $cond: [
+                { $or: [{ $eq: ['$callStatus', null] }, { $eq: [{ $strLenCP: { $ifNull: ['$callStatus', ''] } }, 0] }] },
+                'No Status',
+                { $trim: { input: { $ifNull: ['$callStatus', ''] } } }
+              ]
+            },
+            count: { $sum: 1 }
           }
         }
       ]),
@@ -757,6 +775,13 @@ router.get('/', authenticate, async (req, res) => {
     const interestedCount = coldCallData.interested || 0;
     const callMeetingsBooked = coldCallData.meetingsBooked || 0;
 
+    // Build call status breakdown object for Call Status Distribution chart (same as Prospect Analytics)
+    const callStatusBreakdown = {};
+    (coldCallStatusBreakdownRows || []).forEach((row) => {
+      const status = row._id != null && row._id !== '' ? String(row._id) : 'No Status';
+      callStatusBreakdown[status] = (callStatusBreakdown[status] || 0) + (row.count || 0);
+    });
+
     // Process Email metrics
     const emailData = emailMetrics[0] || {};
     const emailsSentCount = emailData.emailsSent || 0;
@@ -939,7 +964,8 @@ router.get('/', authenticate, async (req, res) => {
           connected: callsConnectedCount,
           decisionMakerConnects,
           interested: interestedCount,
-          meetingsBooked: callMeetingsBooked
+          meetingsBooked: callMeetingsBooked,
+          callStatusBreakdown
         },
 
         // Email

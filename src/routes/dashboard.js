@@ -47,10 +47,15 @@ router.get('/stats', authenticate, async (req, res) => {
     const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
     const validEmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     
-    // Build contact filter - add createdBy filter unless admin
+    // Build contact filter
+    // NOTE: Some legacy imported contacts may have createdBy = null.
+    // To avoid showing empty dashboards for non-admin users, include those legacy records too.
     let contactQueryFilter = {};
     if (!isAdmin) {
-      contactQueryFilter.createdBy = user._id;
+      contactQueryFilter.$or = [
+        { createdBy: user._id },
+        { createdBy: null }
+      ];
     }
     
     // Run all count queries in parallel for better performance
@@ -114,7 +119,10 @@ router.get('/stats', authenticate, async (req, res) => {
       email: { $exists: true, $ne: '', $ne: null }
     };
     if (!isAdmin) {
-      duplicateMatchFilter.createdBy = user._id;
+      duplicateMatchFilter.$or = [
+        { createdBy: user._id },
+        { createdBy: null }
+      ];
     }
     const duplicatePromise = Contact.aggregate([
       {

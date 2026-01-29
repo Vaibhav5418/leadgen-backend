@@ -6,11 +6,12 @@ const authenticate = require('../middleware/auth');
 /**
  * Generate personalized email
  * POST /api/ai/generate-email
- * Body: { contactId, projectId, baseTemplate? }
+ * Body: { contactId, projectId, baseTemplate?, templateType? }
+ * templateType: 'introduction-email' | 'follow-up-email' | 'value-proposition-email' | 'no-template'
  */
 router.post('/generate-email', authenticate, async (req, res) => {
   try {
-    const { contactId, projectId, baseTemplate } = req.body;
+    const { contactId, projectId, baseTemplate, templateType } = req.body;
 
     if (!contactId) {
       return res.status(400).json({
@@ -26,13 +27,15 @@ router.post('/generate-email', authenticate, async (req, res) => {
       });
     }
 
-    // Generate personalized email
-    const result = await generatePersonalizedEmail(contactId, projectId, baseTemplate);
+    // Generate personalized email (templateType drives Introduction / Follow-up / Value Proposition style)
+    const result = await generatePersonalizedEmail(contactId, projectId, baseTemplate, templateType);
 
     res.json({
       success: true,
       data: {
         emailContent: result.emailContent,
+        emailSubject: result.emailSubject || '',
+        emailBody: result.emailBody || result.emailContent,
         contactInfo: result.contactInfo
       }
     });

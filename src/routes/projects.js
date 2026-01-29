@@ -44,6 +44,29 @@ const upload = multer({
   }
 });
 
+// ----------------------------
+// Aggregation helpers (MongoDB-compatible)
+// ----------------------------
+// NOTE: We intentionally avoid newer operators like $regexReplace, since some deployments use older MongoDB versions.
+const _STRIP_SEPARATORS = [' ', '-', '(', ')', '+', '.', '/', '\\'];
+
+function buildStripSeparatorsExpr(stringExpr) {
+  return _STRIP_SEPARATORS.reduce((expr, sep) => {
+    return {
+      $reduce: {
+        input: { $split: [expr, sep] },
+        initialValue: '',
+        in: { $concat: ['$$value', '$$this'] }
+      }
+    };
+  }, stringExpr);
+}
+
+function buildNormalizedPhoneExpr(phoneExpr) {
+  // phoneExpr should evaluate to a string (e.g., { $ifNull: ['$contact.firstPhone', ''] })
+  return buildStripSeparatorsExpr({ $trim: { input: phoneExpr } });
+}
+
 // Create a new project
 router.post('/', authenticate, async (req, res) => {
   try {
@@ -194,7 +217,17 @@ router.get('/analytics', authenticate, async (req, res) => {
   try {
     const Activity = require('../models/Activity');
     const user = req.user;
-    const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
+    const isAdmin = user.isAdmin || (user.email && user.email.toLowerCase() === 'akshay@kology.co');
+    // Simple TTL cache to keep dashboard loads fast
+    // Keyed per-user to avoid leaking data across accounts.
+    const cacheKey = `projects_analytics:${user._id?.toString?.() || user._id}:${isAdmin ? 'admin' : 'user'}`;
+    const nowMs = Date.now();
+    if (!global.__projectsAnalyticsCache) global.__projectsAnalyticsCache = new Map();
+    const cacheEntry = global.__projectsAnalyticsCache.get(cacheKey);
+    const CACHE_TTL_MS = 60 * 1000; // 60s
+    if (cacheEntry && (nowMs - cacheEntry.ts) < CACHE_TTL_MS) {
+      return res.json(cacheEntry.payload);
+    }
     const now = new Date();
     const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -217,24 +250,28 @@ router.get('/analytics', authenticate, async (req, res) => {
     // Build activity filter - include activities from team member projects
     // For team members, show all activities in their assigned projects
     const activityFilter = { projectId: { $in: projectIds } };
+    const userEmailLower = (user.email || '').toLowerCase();
+    // Projects where the current user is a team member (not necessarily creator)
+    const teamMemberProjectIds = !isAdmin
+      ? projects
+          .filter(p => Array.isArray(p.teamMembers) && p.teamMembers.some(e => String(e).toLowerCase() === userEmailLower))
+          .map(p => p._id)
+      : [];
     if (!isAdmin) {
-      // Get projects where user is team member
-      const teamMemberProjects = projects.filter(p => 
-        p.teamMembers && p.teamMembers.includes(user.email.toLowerCase())
-      ).map(p => p._id);
-      
       // If user has team member projects, show all activities in those projects
       // Otherwise, only show activities created by the user
-      if (teamMemberProjects.length > 0) {
+      if (teamMemberProjectIds.length > 0) {
         // Show all activities in team member projects OR activities created by user in their own projects
         activityFilter.$or = [
-          { projectId: { $in: teamMemberProjects } },
+          { projectId: { $in: teamMemberProjectIds } },
           { createdBy: user._id, projectId: { $in: projectIds } }
         ];
       } else {
       activityFilter.createdBy = user._id;
       }
     }
+
+    // Overview totals: admin = all activities in their projects; non-admin = only activities they created or in projects assigned to them (activityFilter above).
     
     // Parallel queries for performance
     const [
@@ -261,20 +298,175 @@ router.get('/analytics', authenticate, async (req, res) => {
       Project.countDocuments({ ...projectFilter, status: 'draft' }),
       Project.countDocuments({ ...projectFilter, status: 'completed' }),
       
-      // Prospect counts - only from existing projects
-      ProjectContact.countDocuments({ projectId: { $in: projectIds } }),
+      // Prospect counts must match Prospect Management (after the same filters + dedupe).
+      // We compute unique-per-project identifiers and then sum per-project counts.
+      ProjectContact.aggregate([
+        { $match: { projectId: { $in: projectIds }, contactId: { $ne: null, $exists: true } } },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'prospectContact'
+          }
+        },
+        {
+          $lookup: {
+            from: 'contacts',
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'legacyContact'
+          }
+        },
+        {
+          $project: {
+            projectId: 1,
+            contact: {
+              $cond: {
+                if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                then: { $arrayElemAt: ['$prospectContact', 0] },
+                else: { $arrayElemAt: ['$legacyContact', 0] }
+              }
+            }
+          }
+        },
+        {
+          $match: {
+            contact: { $ne: null },
+            $or: [
+              { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+              { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+            ]
+          }
+        },
+        {
+          $addFields: {
+            _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+            _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+            _phone: {
+              // MongoDB compatibility: avoid $regexReplace (not available on older versions).
+              // Strip common separators via $split + $reduce.
+              $let: {
+                vars: {
+                  p0: { $trim: { input: { $ifNull: ['$contact.firstPhone', ''] } } }
+                },
+                in: {
+                  $let: {
+                    vars: {
+                      p1: {
+                        $reduce: {
+                          input: { $split: ['$$p0', ' '] },
+                          initialValue: '',
+                          in: { $concat: ['$$value', '$$this'] }
+                        }
+                      }
+                    },
+                    in: {
+                      $let: {
+                        vars: {
+                          p2: {
+                            $reduce: {
+                              input: { $split: ['$$p1', '-'] },
+                              initialValue: '',
+                              in: { $concat: ['$$value', '$$this'] }
+                            }
+                          }
+                        },
+                        in: {
+                          $let: {
+                            vars: {
+                              p3: {
+                                $reduce: {
+                                  input: { $split: ['$$p2', '('] },
+                                  initialValue: '',
+                                  in: { $concat: ['$$value', '$$this'] }
+                                }
+                              }
+                            },
+                            in: {
+                              $let: {
+                                vars: {
+                                  p4: {
+                                    $reduce: {
+                                      input: { $split: ['$$p3', ')'] },
+                                      initialValue: '',
+                                      in: { $concat: ['$$value', '$$this'] }
+                                    }
+                                  }
+                                },
+                                in: {
+                                  $let: {
+                                    vars: {
+                                      p5: {
+                                        $reduce: {
+                                          input: { $split: ['$$p4', '+'] },
+                                          initialValue: '',
+                                          in: { $concat: ['$$value', '$$this'] }
+                                        }
+                                      }
+                                    },
+                                    in: '$$p5'
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          $addFields: {
+            _identifier: {
+              // Deduplicate ONLY when name + phone + email all match.
+              $cond: [
+                {
+                  $and: [
+                    { $gt: [{ $strLenCP: '$_name' }, 0] },
+                    { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                    { $gt: [{ $strLenCP: '$_email' }, 0] }
+                  ]
+                },
+                { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                ''
+              ]
+            }
+          }
+        },
+        {
+          $group: {
+            _id: {
+              projectId: '$projectId',
+              key: {
+                $cond: [
+                  { $gt: [{ $strLenCP: '$_identifier' }, 0] },
+                  '$_identifier',
+                  { $concat: ['id:', { $toString: '$contact._id' }] }
+                ]
+              }
+            }
+          }
+        },
+        { $group: { _id: '$_id.projectId', count: { $sum: 1 } } },
+        { $group: { _id: null, total: { $sum: '$count' } } }
+      ]).then(r => (r && r[0] ? r[0].total : 0)),
       
-      // Activity counts - filter by user unless admin
+      // Activity counts: admin = all in projects; non-admin = only their activities or activities in projects assigned to them
       Activity.countDocuments(activityFilter),
       
-      // Activities by type - filter by user unless admin
+      // Activities by type - same filter (admin sees all, non-admin sees filtered)
       Activity.aggregate([
         { $match: activityFilter },
         { $group: { _id: '$type', count: { $sum: 1 } } },
         { $sort: { count: -1 } }
       ]),
       
-      // Activities by date (last 30 days) - filter by user unless admin
+      // Activities by date (last 30 days) - same filter
       Activity.aggregate([
         { 
           $match: { 
@@ -291,12 +483,92 @@ router.get('/analytics', authenticate, async (req, res) => {
         { $sort: { _id: 1 } }
       ]),
       
-      // Stage distribution - only from existing projects
-      ProjectContact.aggregate([
-        { $match: { projectId: { $in: projectIds } } },
-        { $group: { _id: '$stage', count: { $sum: 1 } } },
-        { $sort: { count: -1 } }
-      ]),
+      // Stage distribution (PIPELINE)
+      // PERFORMANCE: avoid per-contact $lookup into activities (very slow on large datasets).
+      // We compute latest activity stage per (projectId, contactId) once, then add "New" for contacts with no activities.
+      (() => {
+        const activityStagePipeline = [
+          { $match: { ...activityFilter, projectId: { $in: projectIds }, contactId: { $ne: null, $exists: true } } },
+          {
+            $addFields: {
+              _derivedStageRaw: {
+                $cond: [
+                  { $eq: ['$type', 'call'] },
+                  { $ifNull: ['$callStatus', '$status'] },
+                  '$status'
+                ]
+              }
+            }
+          },
+          {
+            $addFields: {
+              derivedStage: {
+                $let: {
+                  vars: { s: { $ifNull: ['$_derivedStageRaw', ''] } },
+                  in: {
+                    $switch: {
+                      branches: [
+                        { case: { $in: ['$$s', ['CIP', 'SQL', 'WON', 'Lost', 'No Reply', 'Not Interested', 'Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting', 'Tech Discussion', 'Low Potential - Open', 'Potential Future']] }, then: '$$s' },
+                        { case: { $in: ['$$s', ['Interested', 'Out of Office']] }, then: 'CIP' },
+                        { case: { $in: ['$$s', ['Bounce', 'Opt-Out']] }, then: 'Lost' },
+                        { case: { $eq: ['$$s', 'Wrong Person'] }, then: 'Lost' },
+                        { case: { $in: ['$$s', ['Details Shared', 'Existing']] }, then: 'CIP' },
+                        { case: { $eq: ['$$s', 'Demo Booked'] }, then: 'Meeting Scheduled' },
+                        { case: { $eq: ['$$s', 'Demo Completed'] }, then: 'Meeting Completed' },
+                        { case: { $eq: ['$$s', 'Future'] }, then: 'Potential Future' },
+                        { case: { $eq: ['$$s', 'Call Back'] }, then: 'CIP' },
+                        { case: { $in: ['$$s', ['Ring', 'Busy', 'Hang Up', 'Switch Off', 'Invalid']] }, then: 'No Reply' }
+                      ],
+                      default: { $cond: [{ $ne: ['$$s', ''] }, '$$s', 'New'] }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          { $sort: { createdAt: -1 } },
+          {
+            $group: {
+              _id: { projectId: '$projectId', contactId: '$contactId' },
+              stage: { $first: '$derivedStage' }
+            }
+          },
+          { $group: { _id: '$stage', count: { $sum: 1 } } }
+        ];
+
+        const activityPairsCountPipeline = [
+          { $match: { ...activityFilter, projectId: { $in: projectIds }, contactId: { $ne: null, $exists: true } } },
+          { $group: { _id: { projectId: '$projectId', contactId: '$contactId' } } },
+          { $count: 'count' }
+        ];
+
+        const totalPairsCountPipeline = [
+          { $match: { projectId: { $in: projectIds }, contactId: { $ne: null, $exists: true } } },
+          { $group: { _id: { projectId: '$projectId', contactId: '$contactId' } } },
+          { $count: 'count' }
+        ];
+
+        return Promise.all([
+          Activity.aggregate(activityStagePipeline).allowDiskUse(true),
+          Activity.aggregate(activityPairsCountPipeline).allowDiskUse(true),
+          ProjectContact.aggregate(totalPairsCountPipeline).allowDiskUse(true)
+        ]).then(([stageCounts, activityPairsCount, totalPairsCount]) => {
+          const activityPairs = activityPairsCount?.[0]?.count || 0;
+          const totalPairs = totalPairsCount?.[0]?.count || 0;
+          const noActivityPairs = Math.max(0, totalPairs - activityPairs);
+
+          const map = new Map();
+          (stageCounts || []).forEach(s => {
+            const key = s._id || 'New';
+            map.set(key, (map.get(key) || 0) + (s.count || 0));
+          });
+          map.set('New', (map.get('New') || 0) + noActivityPairs);
+
+          return Array.from(map.entries())
+            .map(([stage, count]) => ({ _id: stage, count }))
+            .sort((a, b) => b.count - a.count);
+        });
+      })(),
       
       // Channel usage across projects - use projectFilter
       Project.aggregate([
@@ -701,6 +973,99 @@ router.get('/analytics', authenticate, async (req, res) => {
         }
       }
     });
+    // Cache successful response
+    global.__projectsAnalyticsCache.set(cacheKey, {
+      ts: nowMs,
+      payload: {
+        success: true,
+        data: {
+          overview: {
+            totalProjects,
+            activeProjects,
+            draftProjects,
+            completedProjects,
+            totalProspects,
+            totalActivities
+          },
+          activities: {
+            byType: activitiesByType.map(item => ({
+              type: item._id,
+              count: item.count
+            })),
+            byDate: activitiesByDate,
+            trends: {
+              labels: trendLabels,
+              call: trendCallData,
+              email: trendEmailData,
+              linkedin: trendLinkedInData
+            }
+          },
+          pipeline: {
+            stageDistribution: stageDistribution.map(item => ({
+              stage: item._id,
+              count: item.count
+            })),
+            conversion: {
+              winRate: parseFloat(winRate),
+              meetingRate: parseFloat(meetingRate),
+              total: conversionData.total,
+              won: conversionData.won,
+              lost: conversionData.lost,
+              meetings: conversionData.meetings,
+              sql: conversionData.sql,
+              cip: conversionData.cip
+            }
+          },
+          channels: {
+            linkedIn: channelData.linkedIn || 0,
+            email: channelData.email || 0,
+            calling: channelData.calling || 0
+          },
+          team: {
+            performance: teamPerformance.map(member => ({
+              id: member._id?.toString(),
+              name: member.name || 'Unknown',
+              email: member.email || '',
+              totalActivities: member.activityCount,
+              calls: member.calls,
+              emails: member.emails,
+              linkedin: member.linkedin
+            }))
+          },
+          projects: {
+            health: projectHealth.map(project => ({
+              id: project._id.toString(),
+              companyName: project.companyName,
+              status: project.status,
+              contactCount: project.contactCount,
+              activityCount: project.activityCount,
+              recentActivity: project.recentActivity,
+              wonCount: project.wonCount,
+              lostCount: project.lostCount,
+              healthScore: Math.round(project.healthScore)
+            })),
+            topPerformers: topProjects.map(project => ({
+              id: project._id.toString(),
+              companyName: project.companyName,
+              status: project.status,
+              contactCount: project.contactCount,
+              activityCount: project.activityCount,
+              wonCount: project.wonCount,
+              meetingCount: project.meetingCount
+            }))
+          },
+          growth: {
+            monthly: monthlyGrowth.map(item => ({
+              month: item._id,
+              count: item.count
+            }))
+          },
+          recent: {
+            activities: recentActivities
+          }
+        }
+      }
+    });
   } catch (error) {
     console.error('Error fetching project analytics:', error);
     res.status(500).json({
@@ -767,22 +1132,282 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       conversionMetrics,
       topPerformers
     ] = await Promise.all([
-      // Total prospects
-      ProjectContact.countDocuments(projectFilter),
-      
-      // Prospects by stage
+      // Total prospects (deduped to match Prospect Management)
       ProjectContact.aggregate([
         { $match: projectFilter },
-        { $group: { _id: '$stage', count: { $sum: 1 } } },
-        { $sort: { count: -1 } }
-      ]).allowDiskUse(true),
-      
-      // Prospects by priority
-      ProjectContact.aggregate([
-        { $match: projectFilter },
-        { $group: { _id: '$priority', count: { $sum: 1 } } },
-        { $sort: { count: -1 } }
-      ]).allowDiskUse(true),
+        { $match: { contactId: { $ne: null, $exists: true } } },
+        {
+          $lookup: {
+            from: PROSPECT_CONTACT_COLLECTION,
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'prospectContact'
+          }
+        },
+        {
+          $lookup: {
+            from: 'contacts',
+            localField: 'contactId',
+            foreignField: '_id',
+            as: 'legacyContact'
+          }
+        },
+        {
+          $project: {
+            projectId: 1,
+            contact: {
+              $cond: {
+                if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                then: { $arrayElemAt: ['$prospectContact', 0] },
+                else: { $arrayElemAt: ['$legacyContact', 0] }
+              }
+            }
+          }
+        },
+        {
+          $match: {
+            contact: { $ne: null },
+            $or: [
+              { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+              { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+            ]
+          }
+        },
+        {
+          $addFields: {
+            _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+            _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+            _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+          }
+        },
+        {
+          $addFields: {
+            _dedupeKey: {
+              $cond: [
+                {
+                  $and: [
+                    { $gt: [{ $strLenCP: '$_name' }, 0] },
+                    { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                    { $gt: [{ $strLenCP: '$_email' }, 0] }
+                  ]
+                },
+                { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                { $concat: ['id:', { $toString: '$contact._id' }] }
+              ]
+            }
+          }
+        },
+        { $group: { _id: { projectId: '$projectId', key: '$_dedupeKey' } } },
+        { $group: { _id: null, total: { $sum: 1 } } }
+      ]).allowDiskUse(true).then(r => (r && r[0] ? r[0].total : 0)),
+
+      // Prospects by stage (deduped by (name+phone+email) and latest activity)
+      (() => {
+        const base = [
+          { $match: projectFilter },
+          { $match: { contactId: { $ne: null, $exists: true } } },
+          {
+            $lookup: {
+              from: PROSPECT_CONTACT_COLLECTION,
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'prospectContact'
+            }
+          },
+          {
+            $lookup: {
+              from: 'contacts',
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'legacyContact'
+            }
+          },
+          {
+            $project: {
+              projectId: 1,
+              stage: 1,
+              priority: 1,
+              createdAt: 1,
+              contact: {
+                $cond: {
+                  if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                  then: { $arrayElemAt: ['$prospectContact', 0] },
+                  else: { $arrayElemAt: ['$legacyContact', 0] }
+                }
+              }
+            }
+          },
+          {
+            $match: {
+              contact: { $ne: null },
+              $or: [
+                { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+                { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+              ]
+            }
+          },
+          {
+            $addFields: {
+              _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+              _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+              _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+            }
+          },
+          {
+            $addFields: {
+              _dedupeKey: {
+                $cond: [
+                  {
+                    $and: [
+                      { $gt: [{ $strLenCP: '$_name' }, 0] },
+                      { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                      { $gt: [{ $strLenCP: '$_email' }, 0] }
+                    ]
+                  },
+                  { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                  { $concat: ['id:', { $toString: '$contact._id' }] }
+                ]
+              }
+            }
+          },
+          {
+            $lookup: {
+              from: 'activities',
+              let: { pid: '$projectId', cid: '$contact._id' },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ['$projectId', '$$pid'] },
+                        { $eq: ['$contactId', '$$cid'] }
+                      ]
+                    }
+                  }
+                },
+                { $sort: { createdAt: -1 } },
+                { $limit: 1 },
+                { $project: { createdAt: 1 } }
+              ],
+              as: '_lastActivity'
+            }
+          },
+          { $addFields: { _lastActivityAt: { $arrayElemAt: ['$_lastActivity.createdAt', 0] } } },
+          { $sort: { _lastActivityAt: -1, createdAt: -1 } },
+          { $group: { _id: { projectId: '$projectId', key: '$_dedupeKey' }, doc: { $first: '$$ROOT' } } },
+          { $replaceRoot: { newRoot: '$doc' } }
+        ];
+
+        return ProjectContact.aggregate([
+          ...base,
+          { $group: { _id: '$stage', count: { $sum: 1 } } },
+          { $sort: { count: -1 } }
+        ]).allowDiskUse(true);
+      })(),
+
+      // Prospects by priority (deduped by (name+phone+email) and latest activity)
+      (() => {
+        const base = [
+          { $match: projectFilter },
+          { $match: { contactId: { $ne: null, $exists: true } } },
+          {
+            $lookup: {
+              from: PROSPECT_CONTACT_COLLECTION,
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'prospectContact'
+            }
+          },
+          {
+            $lookup: {
+              from: 'contacts',
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'legacyContact'
+            }
+          },
+          {
+            $project: {
+              projectId: 1,
+              stage: 1,
+              priority: 1,
+              createdAt: 1,
+              contact: {
+                $cond: {
+                  if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                  then: { $arrayElemAt: ['$prospectContact', 0] },
+                  else: { $arrayElemAt: ['$legacyContact', 0] }
+                }
+              }
+            }
+          },
+          {
+            $match: {
+              contact: { $ne: null },
+              $or: [
+                { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+                { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+              ]
+            }
+          },
+          {
+            $addFields: {
+              _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+              _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+              _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+            }
+          },
+          {
+            $addFields: {
+              _dedupeKey: {
+                $cond: [
+                  {
+                    $and: [
+                      { $gt: [{ $strLenCP: '$_name' }, 0] },
+                      { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                      { $gt: [{ $strLenCP: '$_email' }, 0] }
+                    ]
+                  },
+                  { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                  { $concat: ['id:', { $toString: '$contact._id' }] }
+                ]
+              }
+            }
+          },
+          {
+            $lookup: {
+              from: 'activities',
+              let: { pid: '$projectId', cid: '$contact._id' },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ['$projectId', '$$pid'] },
+                        { $eq: ['$contactId', '$$cid'] }
+                      ]
+                    }
+                  }
+                },
+                { $sort: { createdAt: -1 } },
+                { $limit: 1 },
+                { $project: { createdAt: 1 } }
+              ],
+              as: '_lastActivity'
+            }
+          },
+          { $addFields: { _lastActivityAt: { $arrayElemAt: ['$_lastActivity.createdAt', 0] } } },
+          { $sort: { _lastActivityAt: -1, createdAt: -1 } },
+          { $group: { _id: { projectId: '$projectId', key: '$_dedupeKey' }, doc: { $first: '$$ROOT' } } },
+          { $replaceRoot: { newRoot: '$doc' } }
+        ];
+
+        return ProjectContact.aggregate([
+          ...base,
+          { $group: { _id: '$priority', count: { $sum: 1 } } },
+          { $sort: { count: -1 } }
+        ]).allowDiskUse(true);
+      })(),
       
       // Activities by type
       Activity.aggregate([
@@ -909,56 +1534,122 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
           .slice(0, 10);
       })(),
       
-      // Stage distribution with details
-      // Check both ProspectContact and Contact collections for legacy data
-      ProjectContact.aggregate([
-        { $match: projectFilter },
-        {
-          $lookup: {
-            from: PROSPECT_CONTACT_COLLECTION,
-            localField: 'contactId',
-            foreignField: '_id',
-            as: 'prospectContact'
-          }
-        },
-        {
-          $lookup: {
-            from: 'contacts', // Legacy Contact collection
-            localField: 'contactId',
-            foreignField: '_id',
-            as: 'legacyContact'
-          }
-        },
-        {
-          $project: {
-            stage: 1,
-            priority: 1,
-            // Prefer ProspectContact, fallback to Contact (just for validation)
-            contact: {
-              $cond: {
-                if: { $gt: [{ $size: '$prospectContact' }, 0] },
-                then: { $arrayElemAt: ['$prospectContact', 0] },
-                else: { $arrayElemAt: ['$legacyContact', 0] }
+      // Stage distribution with details (deduped)
+      (() => {
+        const base = [
+          { $match: projectFilter },
+          { $match: { contactId: { $ne: null, $exists: true } } },
+          {
+            $lookup: {
+              from: PROSPECT_CONTACT_COLLECTION,
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'prospectContact'
+            }
+          },
+          {
+            $lookup: {
+              from: 'contacts',
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'legacyContact'
+            }
+          },
+          {
+            $project: {
+              projectId: 1,
+              stage: 1,
+              priority: 1,
+              createdAt: 1,
+              contact: {
+                $cond: {
+                  if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                  then: { $arrayElemAt: ['$prospectContact', 0] },
+                  else: { $arrayElemAt: ['$legacyContact', 0] }
+                }
               }
             }
-          }
-        },
-        {
-          $group: {
-            _id: '$stage',
-            count: { $sum: 1 },
-            avgPriority: {
-              $avg: {
+          },
+          {
+            $match: {
+              contact: { $ne: null },
+              $or: [
+                { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+                { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+              ]
+            }
+          },
+          {
+            $addFields: {
+              _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+              _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+              _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+            }
+          },
+          {
+            $addFields: {
+              _dedupeKey: {
                 $cond: [
-                  { $eq: ['$priority', 'High'] }, 3,
-                  { $cond: [{ $eq: ['$priority', 'Medium'] }, 2, 1] }
+                  {
+                    $and: [
+                      { $gt: [{ $strLenCP: '$_name' }, 0] },
+                      { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                      { $gt: [{ $strLenCP: '$_email' }, 0] }
+                    ]
+                  },
+                  { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                  { $concat: ['id:', { $toString: '$contact._id' }] }
                 ]
               }
             }
-          }
-        },
-        { $sort: { count: -1 } }
-      ]),
+          },
+          {
+            $lookup: {
+              from: 'activities',
+              let: { pid: '$projectId', cid: '$contact._id' },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ['$projectId', '$$pid'] },
+                        { $eq: ['$contactId', '$$cid'] }
+                      ]
+                    }
+                  }
+                },
+                { $sort: { createdAt: -1 } },
+                { $limit: 1 },
+                { $project: { createdAt: 1 } }
+              ],
+              as: '_lastActivity'
+            }
+          },
+          { $addFields: { _lastActivityAt: { $arrayElemAt: ['$_lastActivity.createdAt', 0] } } },
+          { $sort: { _lastActivityAt: -1, createdAt: -1 } },
+          { $group: { _id: { projectId: '$projectId', key: '$_dedupeKey' }, doc: { $first: '$$ROOT' } } },
+          { $replaceRoot: { newRoot: '$doc' } }
+        ];
+
+        return ProjectContact.aggregate([
+          ...base,
+          {
+            $group: {
+              _id: '$stage',
+              count: { $sum: 1 },
+              avgPriority: {
+                $avg: {
+                  $cond: [
+                    { $eq: ['$priority', 'High'] }, 3,
+                    { $cond: [{ $eq: ['$priority', 'Medium'] }, 2, 1] }
+                  ]
+                }
+              }
+            }
+          },
+          { $sort: { count: -1 } }
+        ]).allowDiskUse(true);
+      })(),
       
       // Cold Calling Funnel - Get all call activities (not just latest) to count contacts that have EVER reached each stage
       Activity.aggregate([
@@ -995,11 +1686,19 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
           }
         },
         {
+          // Ensure "latest" fields are actually from the most recent activity
+          $sort: { emailDate: -1, createdAt: -1 }
+        },
+        {
           $group: {
             _id: '$contactId',
-            emailDate: { $max: '$emailDate' },
-            status: { $last: '$status' },
-            outcome: { $last: '$outcome' }
+            emailDate: { $first: '$emailDate' },
+            status: { $first: '$status' },
+            outcome: { $first: '$outcome' },
+            nextActionDate: { $first: '$nextActionDate' },
+            createdAt: { $first: '$createdAt' },
+            activityCount: { $sum: 1 },
+            sentCount: { $sum: { $cond: [{ $ifNull: ['$emailDate', false] }, 1, 0] } }
           }
         }
       ]).allowDiskUse(true),
@@ -1026,7 +1725,9 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
             status: { $first: '$status' },
             lnRequestSent: { $first: '$lnRequestSent' },
             connected: { $first: '$connected' },
-            createdAt: { $first: '$createdAt' }
+            createdAt: { $first: '$createdAt' },
+            nextActionDate: { $first: '$nextActionDate' },
+            activityCount: { $sum: 1 }
           }
         }
       ]).allowDiskUse(true),
@@ -1100,32 +1801,128 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         { $sort: { '_id.date': 1 } }
       ]),
       
-      // Conversion metrics
-      ProjectContact.aggregate([
-        { $match: projectFilter },
-        {
-          $group: {
-            _id: null,
-            total: { $sum: 1 },
-            won: { $sum: { $cond: [{ $eq: ['$stage', 'WON'] }, 1, 0] } },
-            lost: { $sum: { $cond: [{ $eq: ['$stage', 'Lost'] }, 1, 0] } },
-            meetings: {
-              $sum: {
+      // Conversion metrics (deduped)
+      (() => {
+        const base = [
+          { $match: projectFilter },
+          { $match: { contactId: { $ne: null, $exists: true } } },
+          {
+            $lookup: {
+              from: PROSPECT_CONTACT_COLLECTION,
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'prospectContact'
+            }
+          },
+          {
+            $lookup: {
+              from: 'contacts',
+              localField: 'contactId',
+              foreignField: '_id',
+              as: 'legacyContact'
+            }
+          },
+          {
+            $project: {
+              projectId: 1,
+              stage: 1,
+              priority: 1,
+              createdAt: 1,
+              contact: {
+                $cond: {
+                  if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                  then: { $arrayElemAt: ['$prospectContact', 0] },
+                  else: { $arrayElemAt: ['$legacyContact', 0] }
+                }
+              }
+            }
+          },
+          {
+            $match: {
+              contact: { $ne: null },
+              $or: [
+                { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+                { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+              ]
+            }
+          },
+          {
+            $addFields: {
+              _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+              _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+              _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+            }
+          },
+          {
+            $addFields: {
+              _dedupeKey: {
                 $cond: [
-                  { $in: ['$stage', ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting']] },
-                  1,
-                  0
+                  {
+                    $and: [
+                      { $gt: [{ $strLenCP: '$_name' }, 0] },
+                      { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                      { $gt: [{ $strLenCP: '$_email' }, 0] }
+                    ]
+                  },
+                  { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                  { $concat: ['id:', { $toString: '$contact._id' }] }
                 ]
               }
-            },
-            sql: { $sum: { $cond: [{ $eq: ['$stage', 'SQL'] }, 1, 0] } },
-            cip: { $sum: { $cond: [{ $eq: ['$stage', 'CIP'] }, 1, 0] } }
+            }
+          },
+          {
+            $lookup: {
+              from: 'activities',
+              let: { pid: '$projectId', cid: '$contact._id' },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ['$projectId', '$$pid'] },
+                        { $eq: ['$contactId', '$$cid'] }
+                      ]
+                    }
+                  }
+                },
+                { $sort: { createdAt: -1 } },
+                { $limit: 1 },
+                { $project: { createdAt: 1 } }
+              ],
+              as: '_lastActivity'
+            }
+          },
+          { $addFields: { _lastActivityAt: { $arrayElemAt: ['$_lastActivity.createdAt', 0] } } },
+          { $sort: { _lastActivityAt: -1, createdAt: -1 } },
+          { $group: { _id: { projectId: '$projectId', key: '$_dedupeKey' }, doc: { $first: '$$ROOT' } } },
+          { $replaceRoot: { newRoot: '$doc' } }
+        ];
+
+        return ProjectContact.aggregate([
+          ...base,
+          {
+            $group: {
+              _id: null,
+              total: { $sum: 1 },
+              won: { $sum: { $cond: [{ $eq: ['$stage', 'WON'] }, 1, 0] } },
+              lost: { $sum: { $cond: [{ $eq: ['$stage', 'Lost'] }, 1, 0] } },
+              meetings: {
+                $sum: {
+                  $cond: [
+                    { $in: ['$stage', ['Meeting Scheduled', 'Meeting Completed', 'In-Person Meeting']] },
+                    1,
+                    0
+                  ]
+                }
+              },
+              sql: { $sum: { $cond: [{ $eq: ['$stage', 'SQL'] }, 1, 0] } },
+              cip: { $sum: { $cond: [{ $eq: ['$stage', 'CIP'] }, 1, 0] } }
+            }
           }
-        }
-      ]),
+        ]).allowDiskUse(true);
+      })(),
       
-      // Top performing prospects (by activity count)
-      // Check both ProspectContact and Contact collections for legacy data
+      // Top performing prospects (by activity count), deduped by (name+phone+email)
       Activity.aggregate([
         { $match: projectFilter },
         {
@@ -1138,7 +1935,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         },
         {
           $lookup: {
-            from: 'contacts', // Legacy Contact collection
+            from: 'contacts',
             localField: 'contactId',
             foreignField: '_id',
             as: 'legacyContact'
@@ -1148,7 +1945,6 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
           $project: {
             contactId: 1,
             createdAt: 1,
-            // Prefer ProspectContact, fallback to Contact
             contact: {
               $cond: {
                 if: { $gt: [{ $size: '$prospectContact' }, 0] },
@@ -1160,12 +1956,40 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         },
         {
           $match: {
-            contact: { $ne: null }
+            contact: { $ne: null },
+            $or: [
+              { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+              { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+            ]
+          }
+        },
+        {
+          $addFields: {
+            _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+            _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+            _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+          }
+        },
+        {
+          $addFields: {
+            _dedupeKey: {
+              $cond: [
+                {
+                  $and: [
+                    { $gt: [{ $strLenCP: '$_name' }, 0] },
+                    { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                    { $gt: [{ $strLenCP: '$_email' }, 0] }
+                  ]
+                },
+                { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                { $concat: ['id:', { $toString: '$contactId' }] }
+              ]
+            }
           }
         },
         {
           $group: {
-            _id: '$contactId',
+            _id: '$_dedupeKey',
             name: { $first: '$contact.name' },
             company: { $first: '$contact.company' },
             activityCount: { $sum: 1 },
@@ -1174,7 +1998,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         },
         { $sort: { activityCount: -1 } },
         { $limit: 10 }
-      ])
+      ]).allowDiskUse(true)
     ]);
     
     // Calculate Cold Calling Funnel - Updated 10-stage structure
@@ -1191,7 +2015,7 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     // Get all unique contacts for this project (after deduplication) to ensure counts match what users see
     // This is the same logic as in the KPI endpoint
     const allProjectContactsForFunnel = await ProjectContact.find({ ...projectFilter })
-      .populate('contactId', 'name email company')
+      .populate('contactId', 'name email company firstPhone')
       .lean();
     
     const activityContactIdsForFunnel = await Activity.distinct('contactId', {
@@ -1232,13 +2056,15 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
         _id: pc.contactId?._id,
         name: pc.contactId?.name,
         email: pc.contactId?.email,
-        company: pc.contactId?.company
+        company: pc.contactId?.company,
+        firstPhone: pc.contactId?.firstPhone
       })),
       ...activityBasedContactsForFunnel.map(c => ({
         _id: c._id,
         name: c.name,
         email: c.email,
-        company: c.company
+        company: c.company,
+        firstPhone: c.firstPhone
       }))
     ].filter(c => c._id);
     
@@ -1247,15 +2073,11 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     allContactsForFunnel.forEach(contact => {
       const email = (contact.email || '').trim().toLowerCase();
       const name = (contact.name || '').trim().toLowerCase();
-      const company = (contact.company || '').trim().toLowerCase();
+      const phone = String(contact.firstPhone || '').replace(/\D/g, '').trim();
       
       let identifier = null;
-      if (email && email !== '') {
-        identifier = `email:${email}`;
-      } else if (name && name !== '' && company && company !== '') {
-        identifier = `name+company:${name}|${company}`;
-      } else if (name && name !== '') {
-        identifier = `name:${name}`;
+      if (name && email && phone) {
+        identifier = `npe:${name}|${phone}|${email}`;
       }
       
       if (identifier) {
@@ -1336,15 +2158,11 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
       const email = (contact.email || '').trim().toLowerCase();
       const name = (contact.name || '').trim().toLowerCase();
-      const company = (contact.company || '').trim().toLowerCase();
+      const phone = String(contact.firstPhone || '').replace(/\D/g, '').trim();
       
       let identifier = null;
-      if (email && email !== '') {
-        identifier = `email:${email}`;
-      } else if (name && name !== '' && company && company !== '') {
-        identifier = `name+company:${name}|${company}`;
-      } else if (name && name !== '') {
-        identifier = `name:${name}`;
+      if (name && email && phone) {
+        identifier = `npe:${name}|${phone}|${email}`;
       }
       
       if (identifier) {
@@ -1357,58 +2175,51 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       }
     });
 
-    // Process all call activities to count unique contacts that have EVER reached each stage
-    // Only count activities from deduplicated contacts
-    callFunnel.forEach(c => {
+    // Cold calling funnel counts must be UNIQUE and based on the MOST RECENT call activity per contact.
+    // (This matches the requested "most recently added activity" rule and keeps outside/inside consistent.)
+    const latestCallByContactForFunnel = new Map();
+    (callFunnel || []).forEach(c => {
       const contactId = c.contactId?.toString();
       if (!contactId || !validContactIdsForFunnel.has(contactId)) return;
 
+      const activityDate = c.callDate ? new Date(c.callDate) : new Date(c.createdAt);
+      const existing = latestCallByContactForFunnel.get(contactId);
+      if (!existing || activityDate > existing._activityDate) {
+        latestCallByContactForFunnel.set(contactId, { ...c, _activityDate: activityDate });
+      }
+    });
+
+    latestCallByContactForFunnel.forEach((c, contactId) => {
       // Calls Attempted - any call activity
       if (c.callDate || c.callStatus) {
         callsAttemptedSet.add(contactId);
       }
 
-      // Calls Connected - if callStatus indicates a connection (not failed statuses)
-      // Same logic as KPI endpoint
+      // Calls Connected - answered (not failed statuses)
       if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(c.callStatus)) {
         callsConnectedSet.add(contactId);
       }
 
       // Decision Maker Reached - answered and not "Not Interested"
-      // Same logic as KPI endpoint
       if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(c.callStatus)) {
         decisionMakerReachedSet.add(contactId);
       }
 
-      // Interested - exact match (same as KPI endpoint)
-      if (c.callStatus === 'Interested') {
-        interestedSet.add(contactId);
-      }
-
-      // Details Shared - exact match (same as KPI endpoint)
-      if (c.callStatus === 'Details Shared') {
-        detailsSharedSet.add(contactId);
-      }
-
-      // Demo Booked - exact match (same as KPI endpoint)
-      if (c.callStatus === 'Demo Booked') {
-        demoBookedSet.add(contactId);
-      }
-
-      // Demo Completed - exact match (same as KPI endpoint)
-      if (c.callStatus === 'Demo Completed') {
-        demoCompletedSet.add(contactId);
-      }
+      if (c.callStatus === 'Interested') interestedSet.add(contactId);
+      if (c.callStatus === 'Details Shared') detailsSharedSet.add(contactId);
+      if (c.callStatus === 'Demo Booked') demoBookedSet.add(contactId);
+      if (c.callStatus === 'Demo Completed') demoCompletedSet.add(contactId);
     });
 
-    // Get SQL and WON from ProjectContact stage (same as KPI endpoint)
+    // Get SQL and WON from ProjectContact stage (same as KPI endpoint) but only for valid (deduped) contacts
     const sqlContacts = await ProjectContact.find({
       ...projectFilter,
       stage: 'SQL'
     }).distinct('contactId');
     sqlContacts.forEach(contactId => {
       if (contactId) {
-        sqlSet.add(contactId.toString());
+        const idStr = contactId.toString();
+        if (validContactIdsForFunnel.has(idStr)) sqlSet.add(idStr);
       }
     });
 
@@ -1418,27 +2229,20 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     }).distinct('contactId');
     wonContacts.forEach(contactId => {
       if (contactId) {
-        wonSet.add(contactId.toString());
+        const idStr = contactId.toString();
+        if (validContactIdsForFunnel.has(idStr)) wonSet.add(idStr);
       }
     });
 
-    // Calculate call status breakdown for the donut chart (count all activities by status)
-    // Count all call activities regardless of deduplication to show true status distribution
+    // Calculate call status breakdown for the donut chart using UNIQUE latest status per contact
     const callStatusBreakdown = {};
-    if (callFunnel && callFunnel.length > 0) {
-      callFunnel.forEach(c => {
-        // Count all call activities, not just those from deduplicated contacts
-        // Handle null, undefined, or empty string callStatus
-        let status = 'No Status';
-        if (c.callStatus && typeof c.callStatus === 'string' && c.callStatus.trim() !== '') {
-          status = c.callStatus.trim();
-        }
-        if (!callStatusBreakdown[status]) {
-          callStatusBreakdown[status] = 0;
-        }
-        callStatusBreakdown[status]++;
-      });
-    }
+    latestCallByContactForFunnel.forEach((c) => {
+      let status = 'No Status';
+      if (c.callStatus && typeof c.callStatus === 'string' && c.callStatus.trim() !== '') {
+        status = c.callStatus.trim();
+      }
+      callStatusBreakdown[status] = (callStatusBreakdown[status] || 0) + 1;
+    });
 
     const callFunnelData = {
       prospectData: totalProspects,
@@ -1452,6 +2256,19 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       demoCompleted: demoCompletedSet.size,
       sql: sqlSet.size,
       won: wonSet.size,
+      // Provide the exact contactIds for each stage so the UI popup can show the same unique count.
+      // These ids are already deduped + computed from the most recent call activity per contact.
+      stageContactIds: {
+        callsAttempted: Array.from(callsAttemptedSet),
+        callsConnected: Array.from(callsConnectedSet),
+        decisionMakerReached: Array.from(decisionMakerReachedSet),
+        interested: Array.from(interestedSet),
+        detailsShared: Array.from(detailsSharedSet),
+        demoBooked: Array.from(demoBookedSet),
+        demoCompleted: Array.from(demoCompletedSet),
+        sql: Array.from(sqlSet),
+        won: Array.from(wonSet)
+      },
       // Call status breakdown for donut chart
       callStatusBreakdown: callStatusBreakdown,
       // Legacy fields for backward compatibility
@@ -1465,16 +2282,57 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     };
     
     // Calculate Email Funnel
+    const dedupedEmailFunnel = (emailFunnel || []).filter(e => {
+      const contactId = e?._id?.toString();
+      return contactId && validContactIdsForFunnel.has(contactId);
+    });
+
+    // Build stage contactId sets so popup can match funnel counts exactly (unique + latest per contact).
+    const emailSentSet = new Set();
+    const emailAcceptedSet = new Set();
+    const emailFollowupsSet = new Set();
+    const emailCipSet = new Set();
+    const emailMeetingProposedSet = new Set();
+    const emailScheduledSet = new Set();
+    const emailCompletedSet = new Set();
+    const emailSqlSet = new Set();
+
+    dedupedEmailFunnel.forEach(e => {
+      const contactId = e?._id?.toString();
+      if (!contactId) return;
+
+      if (e.emailDate) emailSentSet.add(contactId);
+      if (['Interested', 'Meeting Proposed', 'Meeting Scheduled'].includes(e.status)) emailAcceptedSet.add(contactId);
+      // "Followups" = more than one email sent
+      if ((e.sentCount || 0) > 1) emailFollowupsSet.add(contactId);
+      if (e.status === 'CIP') emailCipSet.add(contactId);
+      if (e.status === 'Meeting Proposed') emailMeetingProposedSet.add(contactId);
+      if (e.status === 'Meeting Scheduled') emailScheduledSet.add(contactId);
+      if (e.status === 'Meeting Completed') emailCompletedSet.add(contactId);
+      if (e.status === 'SQL' || e.status === 'Meeting Completed') emailSqlSet.add(contactId);
+    });
+
     const emailFunnelData = {
       prospectData: totalProspects,
-      emailSent: emailFunnel.filter(e => e.emailDate).length,
-      accepted: emailFunnel.filter(e => ['Interested', 'Meeting Proposed'].includes(e.status)).length,
-      followups: emailFunnel.filter(e => e.outcome && e.outcome.toLowerCase().includes('follow')).length,
-      cip: emailFunnel.filter(e => e.status === 'CIP').length,
-      meetingProposed: emailFunnel.filter(e => e.status === 'Meeting Proposed').length,
-      scheduled: emailFunnel.filter(e => e.status === 'Meeting Scheduled').length,
-      completed: emailFunnel.filter(e => e.status === 'Meeting Completed').length,
-      sql: emailFunnel.filter(e => e.status === 'SQL' || e.status === 'Meeting Completed').length
+      emailSent: emailSentSet.size,
+      accepted: emailAcceptedSet.size,
+      // Funnel "Followups" in UI means: contacts with >1 activity (same logic as stage popup)
+      followups: emailFollowupsSet.size,
+      cip: emailCipSet.size,
+      meetingProposed: emailMeetingProposedSet.size,
+      scheduled: emailScheduledSet.size,
+      completed: emailCompletedSet.size,
+      sql: emailSqlSet.size,
+      stageContactIds: {
+        emailSent: Array.from(emailSentSet),
+        accepted: Array.from(emailAcceptedSet),
+        followups: Array.from(emailFollowupsSet),
+        cip: Array.from(emailCipSet),
+        meetingProposed: Array.from(emailMeetingProposedSet),
+        scheduled: Array.from(emailScheduledSet),
+        completed: Array.from(emailCompletedSet),
+        sql: Array.from(emailSqlSet)
+      }
     };
     
     // Calculate LinkedIn Funnel - prioritize most recent status
@@ -1487,9 +2345,10 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
     const linkedinCompletedSet = new Set();
     const linkedinSqlSet = new Set();
     
-    linkedinFunnel.forEach(l => {
+    (linkedinFunnel || []).forEach(l => {
       const contactId = l._id?.toString();
       if (!contactId) return;
+      if (!validContactIdsForFunnel.has(contactId)) return;
       
       // Connection Request Sent
       if (l.lnRequestSent === 'Yes' || l.lnRequestSent === true) {
@@ -1548,12 +2407,41 @@ router.get('/prospect-analytics', authenticate, async (req, res) => {
       prospectData: totalProspects,
       connectionSent: linkedinConnectionSentSet.size,
       accepted: linkedinAcceptedSet.size,
-      followups: linkedinFunnel.filter(l => l.status && l.status !== 'CIP' && l.status !== '').length,
+      // Funnel "Followups" in UI means: contacts with >1 activity (same logic as stage popup)
+      followups: (() => {
+        const s = new Set();
+        (linkedinFunnel || []).forEach(l => {
+          const contactId = l?._id?.toString();
+          if (!contactId) return;
+          if (!validContactIdsForFunnel.has(contactId)) return;
+          if ((l.activityCount || 0) > 1) s.add(contactId);
+        });
+        return s.size;
+      })(),
       cip: linkedinCipSet.size,
       meetingProposed: linkedinMeetingProposedSet.size,
       scheduled: linkedinScheduledSet.size,
       completed: linkedinCompletedSet.size,
-      sql: linkedinSqlSet.size
+      sql: linkedinSqlSet.size,
+      stageContactIds: {
+        connectionSent: Array.from(linkedinConnectionSentSet),
+        accepted: Array.from(linkedinAcceptedSet),
+        followups: (() => {
+          const s = new Set();
+          (linkedinFunnel || []).forEach(l => {
+            const contactId = l?._id?.toString();
+            if (!contactId) return;
+            if (!validContactIdsForFunnel.has(contactId)) return;
+            if ((l.activityCount || 0) > 1) s.add(contactId);
+          });
+          return Array.from(s);
+        })(),
+        cip: Array.from(linkedinCipSet),
+        meetingProposed: Array.from(linkedinMeetingProposedSet),
+        scheduled: Array.from(linkedinScheduledSet),
+        completed: Array.from(linkedinCompletedSet),
+        sql: Array.from(linkedinSqlSet)
+      }
     };
     
     // Process conversion metrics
@@ -1792,8 +2680,75 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
       email: user.email || ''
     })).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
     
-    // Get total prospects for the project
-    const totalProspects = await ProjectContact.countDocuments(projectFilter);
+    // Get total prospects for the project (deduped to match Prospect Management)
+    const totalProspects = await ProjectContact.aggregate([
+      { $match: projectFilter },
+      { $match: { contactId: { $ne: null, $exists: true } } },
+      {
+        $lookup: {
+          from: PROSPECT_CONTACT_COLLECTION,
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'prospectContact'
+        }
+      },
+      {
+        $lookup: {
+          from: 'contacts',
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'legacyContact'
+        }
+      },
+      {
+        $project: {
+          projectId: 1,
+          contactId: 1,
+          contact: {
+            $cond: {
+              if: { $gt: [{ $size: '$prospectContact' }, 0] },
+              then: { $arrayElemAt: ['$prospectContact', 0] },
+              else: { $arrayElemAt: ['$legacyContact', 0] }
+            }
+          }
+        }
+      },
+      {
+        $match: {
+          contact: { $ne: null },
+          $or: [
+            { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+            { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+          ]
+        }
+      },
+      {
+        $addFields: {
+          _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+          _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+          _phone: buildNormalizedPhoneExpr({ $ifNull: ['$contact.firstPhone', ''] })
+        }
+      },
+      {
+        $addFields: {
+          _dedupeKey: {
+            $cond: [
+              {
+                $and: [
+                  { $gt: [{ $strLenCP: '$_name' }, 0] },
+                  { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                  { $gt: [{ $strLenCP: '$_email' }, 0] }
+                ]
+              },
+              { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+              { $concat: ['id:', { $toString: '$contactId' }] }
+            ]
+          }
+        }
+      },
+      { $group: { _id: { projectId: '$projectId', key: '$_dedupeKey' } } },
+      { $count: 'count' }
+    ]).allowDiskUse(true).then(r => (r && r[0] ? r[0].count : 0));
     
     // Calculate funnel data for each team member
     const teamMemberFunnels = await Promise.all(
@@ -1828,70 +2783,6 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
           }
         ]);
         
-        // Calculate call funnel stages (unique contacts)
-        const callsAttemptedSet = new Set();
-        const callsConnectedSet = new Set();
-        const decisionMakerReachedSet = new Set();
-        const interestedSet = new Set();
-        const detailsSharedSet = new Set();
-        const demoBookedSet = new Set();
-        const demoCompletedSet = new Set();
-        
-        callActivities.forEach(c => {
-          const contactId = c.contactId?.toString();
-          if (!contactId) return;
-          
-          if (c.callDate || c.callStatus) {
-            callsAttemptedSet.add(contactId);
-          }
-          
-          if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(c.callStatus)) {
-            callsConnectedSet.add(contactId);
-          }
-          
-          if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(c.callStatus)) {
-            decisionMakerReachedSet.add(contactId);
-          }
-          
-          if (c.callStatus === 'Interested') {
-            interestedSet.add(contactId);
-          }
-          
-          if (c.callStatus === 'Details Shared') {
-            detailsSharedSet.add(contactId);
-          }
-          
-          if (c.callStatus === 'Demo Booked') {
-            demoBookedSet.add(contactId);
-          }
-          
-          if (c.callStatus === 'Demo Completed') {
-            demoCompletedSet.add(contactId);
-          }
-        });
-        
-        // Get SQL and WON from ProjectContact for this member's contacts
-        const memberContactIds = Array.from(new Set(callActivities.map(a => a.contactId?.toString()).filter(Boolean)));
-        const memberContactObjectIds = memberContactIds
-          .filter(id => mongoose.Types.ObjectId.isValid(id))
-          .map(id => new mongoose.Types.ObjectId(id));
-        
-        const sqlCount = memberContactObjectIds.length > 0 
-          ? await ProjectContact.countDocuments({
-              ...projectFilter,
-              contactId: { $in: memberContactObjectIds },
-              stage: 'SQL'
-            })
-          : 0;
-        
-        const wonCount = memberContactObjectIds.length > 0
-          ? await ProjectContact.countDocuments({
-              ...projectFilter,
-              contactId: { $in: memberContactObjectIds },
-              stage: 'WON'
-            })
-          : 0;
-        
         // Get LinkedIn activities for this member
         const linkedinActivities = await Activity.aggregate([
           {
@@ -1916,83 +2807,8 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
           }
         ]);
         
-        // Calculate LinkedIn funnel stages
-        const linkedinConnectionSentSet = new Set();
-        const linkedinAcceptedSet = new Set();
-        const linkedinCipSet = new Set();
-        const linkedinMeetingProposedSet = new Set();
-        const linkedinScheduledSet = new Set();
-        const linkedinCompletedSet = new Set();
-        const linkedinSqlSet = new Set();
-        
-        linkedinActivities.forEach(l => {
-          const contactId = l.contactId?.toString();
-          if (!contactId) return;
-          
-          if (l.lnRequestSent === 'Yes' || l.lnRequestSent === true) {
-            linkedinConnectionSentSet.add(contactId);
-          }
-          
-          const currentStatus = l.status;
-          
-          if ((l.connected === 'Yes' || l.connected === true) && 
-              (!currentStatus || currentStatus === '' || 
-               (!['CIP', 'Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'SQL'].includes(currentStatus)))) {
-            linkedinAcceptedSet.add(contactId);
-          }
-          
-          if (currentStatus === 'CIP') {
-            linkedinCipSet.add(contactId);
-            linkedinAcceptedSet.delete(contactId);
-          }
-          
-          if (currentStatus === 'Meeting Proposed') {
-            linkedinMeetingProposedSet.add(contactId);
-            linkedinAcceptedSet.delete(contactId);
-            linkedinCipSet.delete(contactId);
-          }
-          
-          if (currentStatus === 'Meeting Scheduled') {
-            linkedinScheduledSet.add(contactId);
-            linkedinAcceptedSet.delete(contactId);
-            linkedinCipSet.delete(contactId);
-            linkedinMeetingProposedSet.delete(contactId);
-          }
-          
-          if (currentStatus === 'Meeting Completed') {
-            linkedinCompletedSet.add(contactId);
-            linkedinAcceptedSet.delete(contactId);
-            linkedinCipSet.delete(contactId);
-            linkedinMeetingProposedSet.delete(contactId);
-            linkedinScheduledSet.delete(contactId);
-          }
-          
-          if (currentStatus === 'SQL' || currentStatus === 'Meeting Completed') {
-            linkedinSqlSet.add(contactId);
-          }
-        });
-        
-        // Get LinkedIn SQL and WON
-        const linkedinContactIds = Array.from(new Set(linkedinActivities.map(a => a.contactId?.toString()).filter(Boolean)));
-        const linkedinContactObjectIds = linkedinContactIds
-          .filter(id => mongoose.Types.ObjectId.isValid(id))
-          .map(id => new mongoose.Types.ObjectId(id));
-        
-        const linkedinSqlCount = linkedinContactObjectIds.length > 0
-          ? await ProjectContact.countDocuments({
-              ...projectFilter,
-              contactId: { $in: linkedinContactObjectIds },
-              stage: 'SQL'
-            })
-          : 0;
-        
-        const linkedinWonCount = linkedinContactObjectIds.length > 0
-          ? await ProjectContact.countDocuments({
-              ...projectFilter,
-              contactId: { $in: linkedinContactObjectIds },
-              stage: 'WON'
-            })
-          : 0;
+        // NOTE: LinkedIn funnel stages + SQL/WON are calculated after email activities too,
+        // so we can apply the same dedupe-key mapping consistently across all channels.
         
         // Get Email activities for this member
         const emailActivities = await Activity.aggregate([
@@ -2015,8 +2831,174 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
             $sort: { createdAt: -1 }
           }
         ]);
-        
-        // Calculate Email funnel stages
+
+        // Build contactId -> dedupeKey (name+phone+email) map for this member's contacts
+        const allContactIdStrings = Array.from(new Set([
+          ...(callActivities || []).map(a => a.contactId?.toString()).filter(Boolean),
+          ...(linkedinActivities || []).map(a => a.contactId?.toString()).filter(Boolean),
+          ...(emailActivities || []).map(a => a.contactId?.toString()).filter(Boolean)
+        ]));
+
+        const allContactObjectIds = allContactIdStrings
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id));
+
+        const contactById = new Map();
+        if (allContactObjectIds.length > 0) {
+          const prospectContacts = await ProspectContact.find({ _id: { $in: allContactObjectIds } })
+            .select('_id name email firstPhone company')
+            .lean();
+          prospectContacts.forEach(c => contactById.set(c._id.toString(), c));
+
+          const foundIds = new Set(prospectContacts.map(c => c._id.toString()));
+          const remainingIds = allContactObjectIds.filter(id => !foundIds.has(id.toString()));
+          if (remainingIds.length > 0) {
+            const legacyContacts = await Contact.find({ _id: { $in: remainingIds } })
+              .select('_id name email firstPhone company')
+              .lean();
+            legacyContacts.forEach(c => contactById.set(c._id.toString(), c));
+          }
+        }
+
+        const toDedupeKey = (contactIdStr) => {
+          if (!contactIdStr) return null;
+          const c = contactById.get(contactIdStr);
+          const name = String(c?.name || '').trim().toLowerCase();
+          const email = String(c?.email || '').trim().toLowerCase();
+          const phone = String(c?.firstPhone || '').replace(/\D/g, '').trim();
+          if (name && email && phone) return `npe:${name}|${phone}|${email}`;
+          return `id:${contactIdStr}`;
+        };
+
+        // Calculate call funnel stages (deduped)
+        const callsAttemptedSet = new Set();
+        const callsConnectedSet = new Set();
+        const decisionMakerReachedSet = new Set();
+        const interestedSet = new Set();
+        const detailsSharedSet = new Set();
+        const demoBookedSet = new Set();
+        const demoCompletedSet = new Set();
+
+        (callActivities || []).forEach(c => {
+          const contactIdStr = c.contactId?.toString();
+          const key = toDedupeKey(contactIdStr);
+          if (!key) return;
+
+          if (c.callDate || c.callStatus) callsAttemptedSet.add(key);
+          if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(c.callStatus)) callsConnectedSet.add(key);
+          if (c.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(c.callStatus)) decisionMakerReachedSet.add(key);
+          if (c.callStatus === 'Interested') interestedSet.add(key);
+          if (c.callStatus === 'Details Shared') detailsSharedSet.add(key);
+          if (c.callStatus === 'Demo Booked') demoBookedSet.add(key);
+          if (c.callStatus === 'Demo Completed') demoCompletedSet.add(key);
+        });
+
+        // SQL and WON from ProjectContact for this member's call-contactIds (deduped)
+        const memberContactIds = Array.from(new Set((callActivities || []).map(a => a.contactId?.toString()).filter(Boolean)));
+        const memberContactObjectIds = memberContactIds
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id));
+
+        let sqlCount = 0;
+        let wonCount = 0;
+        if (memberContactObjectIds.length > 0) {
+          const sqlIds = await ProjectContact.find({
+            ...projectFilter,
+            contactId: { $in: memberContactObjectIds },
+            stage: 'SQL'
+          }).distinct('contactId');
+          sqlCount = new Set((sqlIds || []).map(id => toDedupeKey(id?.toString()))).size;
+
+          const wonIds = await ProjectContact.find({
+            ...projectFilter,
+            contactId: { $in: memberContactObjectIds },
+            stage: 'WON'
+          }).distinct('contactId');
+          wonCount = new Set((wonIds || []).map(id => toDedupeKey(id?.toString()))).size;
+        }
+
+        // Calculate LinkedIn funnel stages (deduped, hierarchical)
+        const linkedinConnectionSentSet = new Set();
+        const linkedinAcceptedSet = new Set();
+        const linkedinCipSet = new Set();
+        const linkedinMeetingProposedSet = new Set();
+        const linkedinScheduledSet = new Set();
+        const linkedinCompletedSet = new Set();
+        const linkedinSqlSet = new Set();
+
+        (linkedinActivities || []).forEach(l => {
+          const contactIdStr = l.contactId?.toString();
+          const key = toDedupeKey(contactIdStr);
+          if (!key) return;
+
+          if (l.lnRequestSent === 'Yes' || l.lnRequestSent === true) {
+            linkedinConnectionSentSet.add(key);
+          }
+
+          const currentStatus = l.status;
+
+          if ((l.connected === 'Yes' || l.connected === true) &&
+              (!currentStatus || currentStatus === '' ||
+               (!['CIP', 'Meeting Proposed', 'Meeting Scheduled', 'Meeting Completed', 'SQL'].includes(currentStatus)))) {
+            linkedinAcceptedSet.add(key);
+          }
+
+          if (currentStatus === 'CIP') {
+            linkedinCipSet.add(key);
+            linkedinAcceptedSet.delete(key);
+          }
+
+          if (currentStatus === 'Meeting Proposed') {
+            linkedinMeetingProposedSet.add(key);
+            linkedinAcceptedSet.delete(key);
+            linkedinCipSet.delete(key);
+          }
+
+          if (currentStatus === 'Meeting Scheduled') {
+            linkedinScheduledSet.add(key);
+            linkedinAcceptedSet.delete(key);
+            linkedinCipSet.delete(key);
+            linkedinMeetingProposedSet.delete(key);
+          }
+
+          if (currentStatus === 'Meeting Completed') {
+            linkedinCompletedSet.add(key);
+            linkedinAcceptedSet.delete(key);
+            linkedinCipSet.delete(key);
+            linkedinMeetingProposedSet.delete(key);
+            linkedinScheduledSet.delete(key);
+          }
+
+          if (currentStatus === 'SQL' || currentStatus === 'Meeting Completed') {
+            linkedinSqlSet.add(key);
+          }
+        });
+
+        // LinkedIn SQL and WON from ProjectContact for this member's linkedin contactIds (deduped)
+        const linkedinContactIds = Array.from(new Set((linkedinActivities || []).map(a => a.contactId?.toString()).filter(Boolean)));
+        const linkedinContactObjectIds = linkedinContactIds
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id));
+
+        let linkedinSqlCount = 0;
+        let linkedinWonCount = 0;
+        if (linkedinContactObjectIds.length > 0) {
+          const sqlIds = await ProjectContact.find({
+            ...projectFilter,
+            contactId: { $in: linkedinContactObjectIds },
+            stage: 'SQL'
+          }).distinct('contactId');
+          linkedinSqlCount = new Set((sqlIds || []).map(id => toDedupeKey(id?.toString()))).size;
+
+          const wonIds = await ProjectContact.find({
+            ...projectFilter,
+            contactId: { $in: linkedinContactObjectIds },
+            stage: 'WON'
+          }).distinct('contactId');
+          linkedinWonCount = new Set((wonIds || []).map(id => toDedupeKey(id?.toString()))).size;
+        }
+
+        // Calculate Email funnel stages (deduped)
         const emailSentSet = new Set();
         const emailAcceptedSet = new Set();
         const emailCipSet = new Set();
@@ -2024,38 +3006,19 @@ router.get('/team-member-funnels', authenticate, async (req, res) => {
         const emailScheduledSet = new Set();
         const emailCompletedSet = new Set();
         const emailSqlSet = new Set();
-        
-        emailActivities.forEach(e => {
-          const contactId = e.contactId?.toString();
-          if (!contactId) return;
-          
-          if (e.emailDate) {
-            emailSentSet.add(contactId);
-          }
-          
-          if (['Interested', 'Meeting Proposed'].includes(e.status)) {
-            emailAcceptedSet.add(contactId);
-          }
-          
-          if (e.status === 'CIP') {
-            emailCipSet.add(contactId);
-          }
-          
-          if (e.status === 'Meeting Proposed') {
-            emailMeetingProposedSet.add(contactId);
-          }
-          
-          if (e.status === 'Meeting Scheduled') {
-            emailScheduledSet.add(contactId);
-          }
-          
-          if (e.status === 'Meeting Completed') {
-            emailCompletedSet.add(contactId);
-          }
-          
-          if (e.status === 'SQL' || e.status === 'Meeting Completed') {
-            emailSqlSet.add(contactId);
-          }
+
+        (emailActivities || []).forEach(e => {
+          const contactIdStr = e.contactId?.toString();
+          const key = toDedupeKey(contactIdStr);
+          if (!key) return;
+
+          if (e.emailDate) emailSentSet.add(key);
+          if (['Interested', 'Meeting Proposed'].includes(e.status)) emailAcceptedSet.add(key);
+          if (e.status === 'CIP') emailCipSet.add(key);
+          if (e.status === 'Meeting Proposed') emailMeetingProposedSet.add(key);
+          if (e.status === 'Meeting Scheduled') emailScheduledSet.add(key);
+          if (e.status === 'Meeting Completed') emailCompletedSet.add(key);
+          if (e.status === 'SQL' || e.status === 'Meeting Completed') emailSqlSet.add(key);
         });
         
         return {
@@ -2124,15 +3087,7 @@ router.get('/employee-performance', authenticate, async (req, res) => {
     const user = req.user;
     const isAdmin = user.isAdmin || user.email === 'akshay@kology.co';
 
-    // Get all users (only admins can see all users, others see only themselves)
-    let userFilter = {};
-    if (!isAdmin) {
-      userFilter._id = user._id;
-    }
-
-    const users = await User.find(userFilter).select('_id name email').lean();
-
-    // Get all projects for filtering
+    // Get all projects user is allowed to see
     let projectFilter = {};
     if (!isAdmin) {
       projectFilter.$or = [
@@ -2142,6 +3097,47 @@ router.get('/employee-performance', authenticate, async (req, res) => {
     }
 
     const projects = await Project.find(projectFilter).select('_id companyName createdBy teamMembers').lean();
+
+    // Determine which users to include in the report
+    // Admin: all users
+    // Non-admin: the current user + any project creators + any team members on projects the user can access
+    let users = [];
+    if (isAdmin) {
+      users = await User.find({}).select('_id name email').lean();
+    } else {
+      const creatorIds = new Set();
+      const memberEmails = new Set();
+
+      // Include the current user
+      creatorIds.add(user._id.toString());
+      memberEmails.add(user.email);
+      memberEmails.add(user.email.toLowerCase());
+
+      // Include all project creators + team members for accessible projects
+      for (const p of projects) {
+        if (p.createdBy) {
+          creatorIds.add(p.createdBy.toString());
+        }
+        if (Array.isArray(p.teamMembers)) {
+          for (const e of p.teamMembers) {
+            if (!e) continue;
+            memberEmails.add(e);
+            memberEmails.add(String(e).toLowerCase());
+          }
+        }
+      }
+
+      const creatorObjectIds = Array.from(creatorIds)
+        .filter(Boolean)
+        .map((id) => new mongoose.Types.ObjectId(id));
+
+      users = await User.find({
+        $or: [
+          { _id: { $in: creatorObjectIds } },
+          { email: { $in: Array.from(memberEmails) } }
+        ]
+      }).select('_id name email').lean();
+    }
 
     // Build employee performance data
     const employeePerformance = await Promise.all(
@@ -2382,6 +3378,160 @@ router.get('/', authenticate, async (req, res) => {
               $match: {
                 $expr: {
                   $eq: ['$projectId', '$$projectId']
+                }
+              }
+            },
+            // Total Prospects must match Prospect Management for this project.
+            // Prospect Management (`GET /projects/:id/project-contacts`) filters out:
+            // - missing linked contacts
+            // - "default/test" prospects (no email AND no phone)
+            // and deduplicates ONLY when name + phone + email all match.
+            { $match: { contactId: { $ne: null, $exists: true } } },
+            {
+              $lookup: {
+                from: PROSPECT_CONTACT_COLLECTION,
+                localField: 'contactId',
+                foreignField: '_id',
+                as: 'prospectContact'
+              }
+            },
+            {
+              $lookup: {
+                from: 'contacts',
+                localField: 'contactId',
+                foreignField: '_id',
+                as: 'legacyContact'
+              }
+            },
+            {
+              $project: {
+                projectId: 1,
+                contact: {
+                  $cond: {
+                    if: { $gt: [{ $size: '$prospectContact' }, 0] },
+                    then: { $arrayElemAt: ['$prospectContact', 0] },
+                    else: { $arrayElemAt: ['$legacyContact', 0] }
+                  }
+                }
+              }
+            },
+            {
+              $match: {
+                contact: { $ne: null },
+                $or: [
+                  { 'contact.email': { $exists: true, $ne: '', $ne: null } },
+                  { 'contact.firstPhone': { $exists: true, $ne: '', $ne: null } }
+                ]
+              }
+            },
+            {
+              $addFields: {
+                _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+                _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+                _phone: {
+                  // MongoDB compatibility: avoid $regexReplace (not available on older versions).
+                  // Strip common separators via $split + $reduce.
+                  $let: {
+                    vars: {
+                      p0: { $trim: { input: { $ifNull: ['$contact.firstPhone', ''] } } }
+                    },
+                    in: {
+                      $let: {
+                        vars: {
+                          p1: {
+                            $reduce: {
+                              input: { $split: ['$$p0', ' '] },
+                              initialValue: '',
+                              in: { $concat: ['$$value', '$$this'] }
+                            }
+                          }
+                        },
+                        in: {
+                          $let: {
+                            vars: {
+                              p2: {
+                                $reduce: {
+                                  input: { $split: ['$$p1', '-'] },
+                                  initialValue: '',
+                                  in: { $concat: ['$$value', '$$this'] }
+                                }
+                              }
+                            },
+                            in: {
+                              $let: {
+                                vars: {
+                                  p3: {
+                                    $reduce: {
+                                      input: { $split: ['$$p2', '('] },
+                                      initialValue: '',
+                                      in: { $concat: ['$$value', '$$this'] }
+                                    }
+                                  }
+                                },
+                                in: {
+                                  $let: {
+                                    vars: {
+                                      p4: {
+                                        $reduce: {
+                                          input: { $split: ['$$p3', ')'] },
+                                          initialValue: '',
+                                          in: { $concat: ['$$value', '$$this'] }
+                                        }
+                                      }
+                                    },
+                                    in: {
+                                      $let: {
+                                        vars: {
+                                          p5: {
+                                            $reduce: {
+                                              input: { $split: ['$$p4', '+'] },
+                                              initialValue: '',
+                                              in: { $concat: ['$$value', '$$this'] }
+                                            }
+                                          }
+                                        },
+                                        in: '$$p5'
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              $addFields: {
+                _identifier: {
+                  // Deduplicate ONLY when name + phone + email all match.
+                  $cond: [
+                    {
+                      $and: [
+                        { $gt: [{ $strLenCP: '$_name' }, 0] },
+                        { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                        { $gt: [{ $strLenCP: '$_email' }, 0] }
+                      ]
+                    },
+                    { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+                    ''
+                  ]
+                }
+              }
+            },
+            {
+              // If no identifier (should be rare), treat each contact as unique using its id.
+              $group: {
+                _id: {
+                  $cond: [
+                    { $gt: [{ $strLenCP: '$_identifier' }, 0] },
+                    '$_identifier',
+                    { $concat: ['id:', { $toString: '$contact._id' }] }
+                  ]
                 }
               }
             },
@@ -2836,60 +3986,20 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     ).length;
 
     // Calculate Call Funnel Stages
-    // First, get all unique contacts for this project (after deduplication) to ensure counts match what users see
-    // Get all project contacts
+    // Use the same contact set as Prospect Management (ProjectContact-linked prospects only)
+    // so KPI tile counts can match the popup list (which is based on /project-contacts).
     const allProjectContacts = await ProjectContact.find({ projectId: projectObjectId })
-      .populate('contactId', 'name email company')
+      .populate('contactId', 'name email company firstPhone')
       .lean();
-    
-    // Also get activity-based contacts (contacts with activities but no ProjectContact entry)
-    const activityContactIds = await Activity.distinct('contactId', {
-      projectId: projectObjectId,
-      contactId: { $ne: null, $exists: true }
-    });
-    
-    const existingContactIds = new Set(
-      allProjectContacts
-        .map(pc => pc.contactId?._id?.toString())
-        .filter(Boolean)
-    );
-    
-    const missingContactIds = activityContactIds.filter(
-      contactId => contactId && !existingContactIds.has(contactId.toString())
-    );
-    
-    // Get contact details for activity-based contacts
-    let activityBasedContacts = [];
-    if (missingContactIds.length > 0) {
-      const missingObjectIds = missingContactIds
-        .filter(id => mongoose.Types.ObjectId.isValid(id))
-        .map(id => new mongoose.Types.ObjectId(id));
-      
-      const prospectContacts = await ProspectContact.find({ _id: { $in: missingObjectIds } }).lean();
-      const foundIds = new Set(prospectContacts.map(c => c._id.toString()));
-      const remainingIds = missingObjectIds.filter(id => !foundIds.has(id.toString()));
-      
-      let legacyContacts = [];
-      if (remainingIds.length > 0) {
-        legacyContacts = await Contact.find({ _id: { $in: remainingIds } }).lean();
-      }
-      
-      activityBasedContacts = [...prospectContacts, ...legacyContacts];
-    }
-    
-    // Combine all contacts
+
+    // Combine all contacts (project-linked only)
     const allContacts = [
       ...allProjectContacts.map(pc => ({
         _id: pc.contactId?._id,
         name: pc.contactId?.name,
         email: pc.contactId?.email,
-        company: pc.contactId?.company
-      })),
-      ...activityBasedContacts.map(c => ({
-        _id: c._id,
-        name: c.name,
-        email: c.email,
-        company: c.company
+        company: pc.contactId?.company,
+        firstPhone: pc.contactId?.firstPhone
       }))
     ].filter(c => c._id);
     
@@ -2898,15 +4008,11 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     allContacts.forEach(contact => {
       const email = (contact.email || '').trim().toLowerCase();
       const name = (contact.name || '').trim().toLowerCase();
-      const company = (contact.company || '').trim().toLowerCase();
+      const phone = String(contact.firstPhone || '').replace(/\D/g, '').trim();
       
       let identifier = null;
-      if (email && email !== '') {
-        identifier = `email:${email}`;
-      } else if (name && name !== '' && company && company !== '') {
-        identifier = `name+company:${name}|${company}`;
-      } else if (name && name !== '') {
-        identifier = `name:${name}`;
+      if (name && email && phone) {
+        identifier = `npe:${name}|${phone}|${email}`;
       }
       
       if (identifier) {
@@ -2989,15 +4095,11 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
       const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
       const email = (contact.email || '').trim().toLowerCase();
       const name = (contact.name || '').trim().toLowerCase();
-      const company = (contact.company || '').trim().toLowerCase();
+      const phone = String(contact.firstPhone || '').replace(/\D/g, '').trim();
       
       let identifier = null;
-      if (email && email !== '') {
-        identifier = `email:${email}`;
-      } else if (name && name !== '' && company && company !== '') {
-        identifier = `name+company:${name}|${company}`;
-      } else if (name && name !== '') {
-        identifier = `name:${name}`;
+      if (name && email && phone) {
+        identifier = `npe:${name}|${phone}|${email}`;
       }
       
       if (identifier) {
@@ -3011,76 +4113,8 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
       }
     });
     
-    // Now count only activities from deduplicated contacts
-    const callsAttempted = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && (a.callDate || a.callStatus);
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const callsConnected = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && 
-               a.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(a.callStatus);
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const decisionMakerReached = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && 
-               a.callStatus && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up', 'Not Interested'].includes(a.callStatus);
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const interested = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Interested';
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const notInterested = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Not Interested';
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const detailsShared = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Details Shared';
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const demoBooked = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Demo Booked';
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    const demoCompleted = new Set(callActivities
-      .filter(a => {
-        const contactIdStr = a.contactId?.toString();
-        return contactIdStr && validContactIds.has(contactIdStr) && a.callStatus === 'Demo Completed';
-      })
-      .map(a => a.contactId?.toString())
-      .filter(Boolean)
-    ).size;
-    
-    // Follow-up metrics based on nextActionDate for call activities
-    // Use one next action per contact (earliest nextActionDate) so each contact is counted at most once
+    // Call KPIs: base everything on UNIQUE prospects and the MOST RECENTLY ADDED call activity per contact,
+    // so tile counts match popup lists (each contact counted once, by latest call status).
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
@@ -3088,26 +4122,105 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     const dayAfterTomorrow = new Date(tomorrow);
     dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
 
-    const earliestCallNextActionByContact = new Map();
+    // Build latest call per contact by createdAt (most recently added)
+    const latestCallByContact = new Map();
     callActivities.forEach(a => {
-      if (!a.nextActionDate) return;
       const contactIdStr = a.contactId?.toString();
       if (!contactIdStr || !validContactIds.has(contactIdStr)) return;
-      const actionDate = new Date(a.nextActionDate);
-      actionDate.setHours(0, 0, 0, 0);
-      const existing = earliestCallNextActionByContact.get(contactIdStr);
-      if (!existing || actionDate < existing) {
-        earliestCallNextActionByContact.set(contactIdStr, actionDate);
+      if (!(a.callDate || a.callStatus)) return;
+
+      const created = new Date(a.createdAt || 0);
+      const existing = latestCallByContact.get(contactIdStr);
+      if (!existing || created > existing.createdAt) {
+        latestCallByContact.set(contactIdStr, {
+          createdAt: created,
+          activityDate: a.callDate ? new Date(a.callDate) : created,
+          nextActionDate: a.nextActionDate ? new Date(a.nextActionDate) : null,
+          callStatus: a.callStatus || null
+        });
       }
     });
 
+    // Counts and contact ID arrays from latest call only (one bucket per contact)
+    const callMetricContactIds = {
+      totalCalls: [],
+      callsAttempted: [],
+      callsConnected: [],
+      decisionMakerReached: [],
+      interested: [],
+      notInterested: [],
+      detailsShared: [],
+      demoBooked: [],
+      demoCompleted: [],
+      hangUp: [],
+      ring: [],
+      busy: [],
+      switchOff: [],
+      callBack: [],
+      future: [],
+      invalid: [],
+      noStatus: []
+    };
+
+    latestCallByContact.forEach(({ callStatus }, contactIdStr) => {
+      callMetricContactIds.totalCalls.push(contactIdStr);
+      callMetricContactIds.callsAttempted.push(contactIdStr);
+
+      const status = (callStatus && String(callStatus).trim()) || 'No Status';
+      const connected = status && !['Ring', 'Busy', 'Switch Off', 'Invalid', 'Hang Up'].includes(status);
+      const decisionMaker = connected && status !== 'Not Interested';
+
+      if (connected) callMetricContactIds.callsConnected.push(contactIdStr);
+      if (decisionMaker) callMetricContactIds.decisionMakerReached.push(contactIdStr);
+      if (status === 'Interested') callMetricContactIds.interested.push(contactIdStr);
+      if (status === 'Not Interested') callMetricContactIds.notInterested.push(contactIdStr);
+      if (status === 'Details Shared') callMetricContactIds.detailsShared.push(contactIdStr);
+      if (status === 'Demo Booked') callMetricContactIds.demoBooked.push(contactIdStr);
+      if (status === 'Demo Completed') callMetricContactIds.demoCompleted.push(contactIdStr);
+      if (status === 'Hang Up') callMetricContactIds.hangUp.push(contactIdStr);
+      if (status === 'Ring') callMetricContactIds.ring.push(contactIdStr);
+      if (status === 'Busy') callMetricContactIds.busy.push(contactIdStr);
+      if (status === 'Switch Off') callMetricContactIds.switchOff.push(contactIdStr);
+      if (status === 'Call Back') callMetricContactIds.callBack.push(contactIdStr);
+      if (status === 'Future') callMetricContactIds.future.push(contactIdStr);
+      if (status === 'Invalid') callMetricContactIds.invalid.push(contactIdStr);
+      if (status === 'No Status') callMetricContactIds.noStatus.push(contactIdStr);
+    });
+
+    // Total Calls = all call activities (1st, 2nd, 3rd, ...) for unique prospects only
+    const totalCallsCount = callActivities.filter(a => {
+      const contactIdStr = a.contactId?.toString();
+      return contactIdStr && validContactIds.has(contactIdStr) && (a.callDate || a.callStatus);
+    }).length;
+
+    const callsAttempted = callMetricContactIds.callsAttempted.length;
+    const callsConnected = callMetricContactIds.callsConnected.length;
+    const decisionMakerReached = callMetricContactIds.decisionMakerReached.length;
+    const interested = callMetricContactIds.interested.length;
+    const notInterested = callMetricContactIds.notInterested.length;
+    const detailsShared = callMetricContactIds.detailsShared.length;
+    const demoBooked = callMetricContactIds.demoBooked.length;
+    const demoCompleted = callMetricContactIds.demoCompleted.length;
+
+    // Follow-up metrics from same latest call per contact
     let todayFollowups = 0;
     let tomorrowFollowups = 0;
     let missedFollowups = 0;
-    earliestCallNextActionByContact.forEach((actionDate) => {
-      if (actionDate >= today && actionDate < tomorrow) todayFollowups += 1;
-      else if (actionDate >= tomorrow && actionDate < dayAfterTomorrow) tomorrowFollowups += 1;
-      else if (actionDate < today) missedFollowups += 1;
+    const followupContactIds = { today: [], tomorrow: [], missed: [] };
+    latestCallByContact.forEach(({ nextActionDate }, contactIdStr) => {
+      if (!nextActionDate || isNaN(nextActionDate.getTime())) return;
+      const d = new Date(nextActionDate);
+      d.setHours(0, 0, 0, 0);
+      if (d >= today && d < tomorrow) {
+        todayFollowups += 1;
+        followupContactIds.today.push(contactIdStr);
+      } else if (d >= tomorrow && d < dayAfterTomorrow) {
+        tomorrowFollowups += 1;
+        followupContactIds.tomorrow.push(contactIdStr);
+      } else if (d < today) {
+        missedFollowups += 1;
+        followupContactIds.missed.push(contactIdStr);
+      }
     });
     
     // Get SQL and WON from project contacts (stage field) for deduplicated contacts
@@ -3191,6 +4304,16 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
         const contactIdStr = a.contactId?.toString();
         return contactIdStr && validContactIds.has(contactIdStr) && 
                a.status && a.status === 'Meeting Completed';
+      })
+      .map(a => a.contactId?.toString())
+      .filter(Boolean)
+    ).size;
+
+    // Not Interested (LinkedIn): unique contacts where LinkedIn status is "Not Interested"
+    const linkedInNotInterested = new Set(linkedInActivities
+      .filter(a => {
+        const contactIdStr = a.contactId?.toString();
+        return contactIdStr && validContactIds.has(contactIdStr) && a.status === 'Not Interested';
       })
       .map(a => a.contactId?.toString())
       .filter(Boolean)
@@ -3291,6 +4414,9 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
     
     // Email bounce
     const emailBounce = emailActivities.filter(a => a.status === 'Bounce').length;
+
+    // Not Interested (Email): count emails marked as "Not Interested"
+    const emailNotInterested = emailActivities.filter(a => a.status === 'Not Interested').length;
     
     // Legacy metrics (for backward compatibility)
     const emailOpens = emailAccepted;
@@ -3321,6 +4447,7 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
           completed,
           sql: linkedInSqlContacts,
           win: linkedInWonContacts,
+          notInterested: linkedInNotInterested,
           // Legacy metrics (for backward compatibility)
           connectionRequestsSent,
           connectionsAccepted,
@@ -3337,7 +4464,9 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
           callsInterested,
           callInterestedRate: parseFloat(callInterestedRate),
           meetingsBooked: callMeetings,
-          // Funnel stages
+          // Total Calls = all activities (1st, 2nd, 3rd...) for unique prospects
+          totalCallsCount,
+          // Funnel stages (unique prospects, latest call only)
           callsAttempted,
           callsConnected,
           decisionMakerReached,
@@ -3350,7 +4479,9 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
           won: wonContacts,
           todayFollowups,
           tomorrowFollowups,
-          missedFollowups
+          missedFollowups,
+          followupContactIds,
+          callMetricContactIds
         },
         email: {
           emailsSent,
@@ -3362,6 +4493,7 @@ router.get('/:id/kpi-metrics', authenticate, async (req, res) => {
           completed: emailCompleted,
           sql: emailSqlContacts,
           emailBounce,
+          notInterested: emailNotInterested,
           // Legacy metrics (for backward compatibility)
           emailOpens,
           emailOpenRate: parseFloat(emailOpenRate),
@@ -3421,8 +4553,8 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       });
     }
 
-    // Optimized aggregation pipeline using $facet to get count and data in one query
-    // This reduces database round trips and improves performance
+    // Aggregation for Prospect Management list.
+    // IMPORTANT: We dedupe in the DB (by identifier) so pagination.total is accurate and stable.
     const pipeline = [
       // Match project contacts - use index
       {
@@ -3453,6 +4585,7 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       // Combine both lookups - prefer ProspectContact, fallback to Contact
       {
         $project: {
+          projectId: 1,
           contact: {
             $cond: {
               if: { $gt: [{ $size: '$prospectContact' }, 0] },
@@ -3489,6 +4622,154 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
           ]
         }
       }] : []),
+      // Build a dedupe identifier:
+      // ONLY dedupe when name + phone + email all match; otherwise fallback id (unique).
+      {
+        $addFields: {
+          _email: { $toLower: { $trim: { input: { $ifNull: ['$contact.email', ''] } } } },
+          _name: { $toLower: { $trim: { input: { $ifNull: ['$contact.name', ''] } } } },
+          _phone: {
+            // MongoDB compatibility: avoid $regexReplace (not available on older versions).
+            // Strip common separators via $split + $reduce.
+            $let: {
+              vars: {
+                p0: { $trim: { input: { $ifNull: ['$contact.firstPhone', ''] } } }
+              },
+              in: {
+                $let: {
+                  vars: {
+                    p1: {
+                      $reduce: {
+                        input: { $split: ['$$p0', ' '] },
+                        initialValue: '',
+                        in: { $concat: ['$$value', '$$this'] }
+                      }
+                    }
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        p2: {
+                          $reduce: {
+                            input: { $split: ['$$p1', '-'] },
+                            initialValue: '',
+                            in: { $concat: ['$$value', '$$this'] }
+                          }
+                        }
+                      },
+                      in: {
+                        $let: {
+                          vars: {
+                            p3: {
+                              $reduce: {
+                                input: { $split: ['$$p2', '('] },
+                                initialValue: '',
+                                in: { $concat: ['$$value', '$$this'] }
+                              }
+                            }
+                          },
+                          in: {
+                            $let: {
+                              vars: {
+                                p4: {
+                                  $reduce: {
+                                    input: { $split: ['$$p3', ')'] },
+                                    initialValue: '',
+                                    in: { $concat: ['$$value', '$$this'] }
+                                  }
+                                }
+                              },
+                              in: {
+                                $let: {
+                                  vars: {
+                                    p5: {
+                                      $reduce: {
+                                        input: { $split: ['$$p4', '+'] },
+                                        initialValue: '',
+                                        in: { $concat: ['$$value', '$$this'] }
+                                      }
+                                    }
+                                  },
+                                  in: '$$p5'
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        $addFields: {
+          _identifier: {
+            $cond: [
+              {
+                $and: [
+                  { $gt: [{ $strLenCP: '$_name' }, 0] },
+                  { $gt: [{ $strLenCP: '$_phone' }, 0] },
+                  { $gt: [{ $strLenCP: '$_email' }, 0] }
+                ]
+              },
+              { $concat: ['npe:', '$_name', '|', '$_phone', '|', '$_email'] },
+              ''
+            ]
+          }
+        }
+      },
+      {
+        $addFields: {
+          _identifier: {
+            $cond: [
+              { $gt: [{ $strLenCP: '$_identifier' }, 0] },
+              '$_identifier',
+              { $concat: ['id:', { $toString: '$contact._id' }] }
+            ]
+          }
+        }
+      },
+      // Most recent activity date per contact (used to decide which duplicate to keep)
+      {
+        $lookup: {
+          from: 'activities',
+          let: { pid: '$projectId', cid: '$contact._id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$projectId', '$$pid'] },
+                    { $eq: ['$contactId', '$$cid'] }
+                  ]
+                }
+              }
+            },
+            { $sort: { createdAt: -1 } },
+            { $limit: 1 },
+            { $project: { createdAt: 1 } }
+          ],
+          as: '_lastActivity'
+        }
+      },
+      {
+        $addFields: {
+          _lastActivityAt: { $arrayElemAt: ['$_lastActivity.createdAt', 0] }
+        }
+      },
+      // Sort so the "best" record per identifier comes first, then group.
+      { $sort: { _lastActivityAt: -1, createdAt: -1 } },
+      {
+        $group: {
+          _id: '$_identifier',
+          doc: { $first: '$$ROOT' }
+        }
+      },
+      { $replaceRoot: { newRoot: '$doc' } },
       // Use $facet to get both count and data in one query
       {
         $facet: {
@@ -3532,274 +4813,15 @@ router.get('/:id/project-contacts', authenticate, async (req, res) => {
       }
     ];
 
-    // Execute single optimized query with $facet
     const [result] = await ProjectContact.aggregate(pipeline).allowDiskUse(true);
-    
-    // Extract data and count from facet result
     const contactsResult = result?.data || [];
     const total = result?.total?.[0]?.count || 0;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
 
-    const totalPages = Math.ceil(total / limit);
-
-    // Only fetch activity-based prospects on first page to improve performance
-    // For subsequent pages, only show ProjectContact-based prospects
-    // Limit activity-based prospects to avoid performance issues
-    let additionalProspects = [];
-    if (page === 1 && limit <= 100) {
-      // Get prospects that have activities for this project but no ProjectContact entry
-      // Only fetch if limit is reasonable (<= 100) to avoid performance issues
-      const activitiesWithContacts = await Activity.aggregate([
-        {
-          $match: {
-            projectId: projectObjectId,
-            contactId: { $ne: null, $exists: true }
-          }
-        },
-        {
-          $group: {
-            _id: '$contactId'
-          }
-        },
-        { $limit: 50 } // Limit to first 50 to avoid performance issues
-      ]).allowDiskUse(true);
-
-    const activityContactIds = activitiesWithContacts.map(a => a._id).filter(id => id != null);
-    
-      if (activityContactIds.length > 0) {
-    // Get contactIds that already have ProjectContact entries
-    const existingProjectContacts = await ProjectContact.find(
-      { projectId: projectObjectId },
-      { contactId: 1 }
-        ).limit(100).lean(); // Limit to improve performance
-        
-    const existingContactIds = new Set(
-      existingProjectContacts
-        .map(pc => pc.contactId)
-        .filter(id => id != null)
-        .map(id => id.toString())
-    );
-
-    // Find contactIds with activities but no ProjectContact entry
-    const missingContactIds = activityContactIds.filter(
-      contactId => {
-        if (!contactId) return false;
-        const contactIdStr = contactId.toString();
-        return !existingContactIds.has(contactIdStr);
-      }
-        ).slice(0, 50); // Limit to 50 additional prospects
-
-    // Fetch prospects that have activities but no ProjectContact entry
-    if (missingContactIds.length > 0) {
-      const missingObjectIds = missingContactIds.map(id => new mongoose.Types.ObjectId(id));
-      
-      // Try to find in ProspectContact first
-      const prospectContacts = await ProspectContact.find(
-        { _id: { $in: missingObjectIds } }
-      ).lean();
-      
-      // Find which IDs were found in ProspectContact
-      const foundInProspectContact = new Set(
-        prospectContacts.map(pc => pc._id.toString())
-      );
-      
-      // Find remaining IDs that weren't in ProspectContact, check Contact collection
-      const remainingIds = missingObjectIds.filter(
-        id => !foundInProspectContact.has(id.toString())
-      );
-      
-      let legacyContacts = [];
-      if (remainingIds.length > 0) {
-        legacyContacts = await Contact.find(
-          { _id: { $in: remainingIds } }
-        ).lean();
-      }
-      
-      // Combine both results
-      const allAdditionalContacts = [...prospectContacts, ...legacyContacts];
-      
-      // Format additional prospects to match the structure of contactsResult
-      additionalProspects = allAdditionalContacts.map(contact => ({
-        _id: contact._id,
-        name: contact.name,
-        title: contact.title,
-        company: contact.company,
-        email: contact.email,
-        firstPhone: contact.firstPhone,
-        category: contact.category,
-        industry: contact.industry,
-        keywords: contact.keywords,
-        city: contact.city,
-        state: contact.state,
-        country: contact.country,
-        companyCity: contact.companyCity,
-        companyState: contact.companyState,
-        companyCountry: contact.companyCountry,
-        personLinkedinUrl: contact.personLinkedinUrl,
-        companyLinkedinUrl: contact.companyLinkedinUrl,
-        website: contact.website,
-        employees: contact.employees,
-            projectContactId: null,
-            stage: 'New',
-            assignedTo: '',
-            priority: 'Medium',
-        isImported: false,
-        matchType: 'activity'
-      }));
-        }
-      }
-    }
-
-    // Combine results and remove duplicates
-    const allContactsMap = new Map();
-    
-    // Add ProjectContact-based prospects
-    contactsResult.forEach(contact => {
-      allContactsMap.set(contact._id.toString(), contact);
-    });
-    
-    // Add activity-based prospects (only if not already present and on first page)
-    if (page === 1) {
-    additionalProspects.forEach(contact => {
-      if (!allContactsMap.has(contact._id.toString())) {
-        allContactsMap.set(contact._id.toString(), contact);
-      }
-    });
-    }
-
-    // Convert map to array - already sorted by pipeline
-    let paginatedContacts = Array.from(allContactsMap.values());
-    
-    // Remove duplicates based on identifying information (email, name+company, or name)
-    // Keep the contact with the most recent activity
-    const duplicateGroups = new Map(); // key: identifier, value: array of contacts
-    
-    // Group contacts by identifying information
-    paginatedContacts.forEach(contact => {
-      const email = (contact.email || '').trim().toLowerCase();
-      const name = (contact.name || '').trim().toLowerCase();
-      const company = (contact.company || '').trim().toLowerCase();
-      
-      // Create identifier: prefer email, then name+company, then name
-      let identifier = null;
-      if (email && email !== '') {
-        identifier = `email:${email}`;
-      } else if (name && name !== '' && company && company !== '') {
-        identifier = `name+company:${name}|${company}`;
-      } else if (name && name !== '') {
-        identifier = `name:${name}`;
-      }
-      
-      if (identifier) {
-        if (!duplicateGroups.has(identifier)) {
-          duplicateGroups.set(identifier, []);
-        }
-        duplicateGroups.get(identifier).push(contact);
-      }
-    });
-    
-    // For each duplicate group, find the contact with the most recent activity
-    const contactsToRemove = new Set();
-    
-    // Process duplicate groups in batches to avoid too many queries
-    const duplicateGroupsArray = Array.from(duplicateGroups.entries()).filter(([_, contacts]) => contacts.length > 1);
-    
-    if (duplicateGroupsArray.length > 0) {
-      // Collect all contact IDs that might be duplicates
-      const allDuplicateContactIds = [];
-      duplicateGroupsArray.forEach(([_, contacts]) => {
-        contacts.forEach(contact => {
-          const contactId = contact._id?.toString ? contact._id.toString() : String(contact._id);
-          if (contactId && mongoose.Types.ObjectId.isValid(contactId)) {
-            allDuplicateContactIds.push(new mongoose.Types.ObjectId(contactId));
-          }
-        });
-      });
-      
-      if (allDuplicateContactIds.length > 0) {
-        // Get the most recent activity for each contact in one query
-        const mostRecentActivities = await Activity.aggregate([
-          {
-            $match: {
-              projectId: projectObjectId,
-              contactId: { $in: allDuplicateContactIds }
-            }
-          },
-          {
-            $group: {
-              _id: '$contactId',
-              mostRecentActivityDate: { $max: '$createdAt' }
-            }
-          }
-        ]);
-        
-        // Create a map of contactId -> most recent activity date
-        const activityDateMap = new Map();
-        mostRecentActivities.forEach(activity => {
-          if (activity._id) {
-            activityDateMap.set(activity._id.toString(), activity.mostRecentActivityDate);
-          }
-        });
-        
-        // For each duplicate group, find the contact with the most recent activity
-        for (const [identifier, contacts] of duplicateGroupsArray) {
-          let contactToKeep = null;
-          let mostRecentDate = null;
-          
-          contacts.forEach(contact => {
-            const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
-            const activityDate = activityDateMap.get(contactIdStr);
-            
-            if (activityDate) {
-              // Has activity - prefer this one
-              if (!mostRecentDate || activityDate > mostRecentDate) {
-                mostRecentDate = activityDate;
-                contactToKeep = contact;
-              }
-            } else if (!contactToKeep) {
-              // No activity found yet, use this as fallback (prefer ProjectContact entries)
-              if (!contactToKeep || contact.projectContactId) {
-                contactToKeep = contact;
-              }
-            }
-          });
-          
-          // If no contact has activity, keep the first one (or one with projectContactId)
-          if (!contactToKeep) {
-            contactToKeep = contacts.find(c => c.projectContactId) || contacts[0];
-          }
-          
-          // Mark other contacts in the group for removal
-          const contactToKeepId = contactToKeep._id?.toString ? contactToKeep._id.toString() : String(contactToKeep._id);
-          contacts.forEach(contact => {
-            const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
-            if (contactIdStr !== contactToKeepId) {
-              contactsToRemove.add(contactIdStr);
-            }
-          });
-        }
-      }
-    }
-    
-    // Filter out duplicates, keeping only the ones with most recent activity
-    paginatedContacts = paginatedContacts.filter(contact => {
-      const contactIdStr = contact._id?.toString ? contact._id.toString() : String(contact._id);
-      // Keep if it's not marked for removal
-      return !contactsToRemove.has(contactIdStr);
-    });
-    
-    // Update total count to reflect deduplicated results
-    const deduplicatedTotal = total - contactsToRemove.size;
-    const deduplicatedTotalPages = Math.ceil(deduplicatedTotal / limit);
-
-    res.json({
+    return res.json({
       success: true,
-      data: paginatedContacts,
-      pagination: {
-        page,
-        limit,
-        total: deduplicatedTotal,
-        totalPages: deduplicatedTotalPages
-      }
+      data: contactsResult,
+      pagination: { page, limit, total, totalPages }
     });
   } catch (error) {
     console.error('Error fetching project contacts:', error);
@@ -5869,6 +6891,79 @@ router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, 
     const { projectId, contactId } = req.params;
     const { stage, assignedTo, priority } = req.body;
 
+    // Map incoming "status"-like values (e.g. "Interested") to valid ProjectContact.stage enum values.
+    // ActivityLogModal currently calls this endpoint with `stage: formData.status`, which is not always a valid stage.
+    const allowedStages = (ProjectContact.schema?.path('stage')?.enumValues || []).filter(Boolean);
+    const normalizeProjectContactStage = (rawStage) => {
+      if (rawStage === undefined || rawStage === null) return null;
+      const s = String(rawStage).trim();
+      if (!s) return null;
+      if (allowedStages.includes(s)) return s;
+
+      const key = s.toLowerCase();
+      const map = {
+        // Common "status" values → stages
+        'interested': 'CIP',
+        'details shared': 'CIP',
+        'existing': 'CIP',
+        'call back': 'CIP',
+        'callback': 'CIP',
+        'follow up': 'CIP',
+        'follow-up': 'CIP',
+        'future': 'Potential Future',
+        'potential future': 'Potential Future',
+        'low potential - open': 'Low Potential - Open',
+        'not interested': 'Not Interested',
+
+        // Meetings
+        'demo booked': 'Meeting Scheduled',
+        'meeting proposed': 'Meeting Proposed',
+        'meeting scheduled': 'Meeting Scheduled',
+        'in-person meeting': 'In-Person Meeting',
+        'in person meeting': 'In-Person Meeting',
+        'demo completed': 'Meeting Completed',
+        'meeting completed': 'Meeting Completed',
+        'tech discussion': 'Tech Discussion',
+
+        // Call outcomes that imply "No Reply"
+        'ring': 'No Reply',
+        'ringing': 'No Reply',
+        'busy': 'No Reply',
+        'hang up': 'No Reply',
+        'hung up': 'No Reply',
+        'switch off': 'No Reply',
+        'switched off': 'No Reply',
+        'invalid': 'No Reply',
+        'wrong number': 'No Reply',
+        'no reply': 'No Reply',
+
+        // Email / LinkedIn outcomes that imply lost
+        'bounce': 'Lost',
+        'bounced': 'Lost',
+        'opt-out': 'Lost',
+        'opt out': 'Lost',
+        'unsubscribed': 'Lost',
+        'wrong person': 'Lost',
+
+        // Direct stage shortcuts
+        'cip': 'CIP',
+        'sql': 'SQL',
+        'won': 'WON',
+        'lost': 'Lost',
+        'new': 'New',
+        'contacted': 'Contacted',
+        'qualified': 'Qualified',
+        'proposal': 'Proposal',
+        'negotiation': 'Negotiation'
+      };
+
+      const mapped = map[key] || null;
+      if (mapped && allowedStages.includes(mapped)) return mapped;
+      return null;
+    };
+
+    const normalizedStage = normalizeProjectContactStage(stage);
+
     // Validate ObjectIds
     if (!mongoose.Types.ObjectId.isValid(projectId)) {
       return res.status(400).json({
@@ -5913,7 +7008,7 @@ router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, 
       const newProjectContact = new ProjectContact({
         projectId: projectId,
         contactId: contactId,
-        stage: stage || 'New',
+        stage: normalizedStage || 'New',
         assignedTo: assignedTo || '',
         priority: priority || 'Medium',
         createdBy: req.user._id
@@ -5926,7 +7021,13 @@ router.put('/:projectId/project-contacts/:contactId', authenticate, async (req, 
     }
 
     // Update existing project-contact
-    if (stage) projectContact.stage = stage;
+    // If stage was provided but cannot be normalized to an allowed enum, ignore it to avoid 400s
+    // from ActivityLogModal when saving activities (it uses activity "status" values).
+    if (stage !== undefined) {
+      if (normalizedStage) {
+        projectContact.stage = normalizedStage;
+      }
+    }
     if (assignedTo !== undefined) projectContact.assignedTo = assignedTo;
     if (priority) projectContact.priority = priority;
 

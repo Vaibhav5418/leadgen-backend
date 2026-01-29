@@ -18,6 +18,7 @@ router.post('/', authenticate, async (req, res) => {
       contactId,
       type,
       template,
+      subject,
       outcome,
       conversationNotes,
       nextAction,
@@ -100,6 +101,7 @@ router.post('/', authenticate, async (req, res) => {
       contactId: contactId || null,
       type,
       template: template || '',
+      subject: subject || null,
       outcome: null, // Outcome is not used for any activity types
       conversationNotes: conversationNotes ? conversationNotes.trim() : '',
       nextAction: nextAction || null,
@@ -712,6 +714,7 @@ router.put('/:id', authenticate, async (req, res) => {
   try {
     const {
       template,
+      subject,
       conversationNotes,
       nextAction,
       nextActionDate,
@@ -756,6 +759,7 @@ router.put('/:id', authenticate, async (req, res) => {
 
     // Update fields
     if (template !== undefined) activity.template = template || '';
+    if (subject !== undefined) activity.subject = subject || null;
     if (conversationNotes !== undefined) activity.conversationNotes = conversationNotes ? conversationNotes.trim() : '';
     if (nextAction !== undefined) activity.nextAction = nextAction || null;
     if (nextActionDate !== undefined) activity.nextActionDate = selectedDate || null;

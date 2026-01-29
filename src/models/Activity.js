@@ -21,6 +21,12 @@ const activitySchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  subject: {
+    type: String,
+    required: false,
+    trim: true,
+    default: null
+  },
   outcome: {
     type: String,
     required: false,
