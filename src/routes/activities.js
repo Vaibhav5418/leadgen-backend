@@ -384,6 +384,15 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
         }
       },
       {
+        $lookup: {
+          from: 'users',
+          localField: 'createdBy',
+          foreignField: '_id',
+          as: 'createdByUser',
+          pipeline: [{ $project: { name: 1, email: 1 } }]
+        }
+      },
+      {
         $project: {
           projectId: {
             _id: '$project._id',
@@ -426,6 +435,7 @@ router.get('/contact/:contactId', authenticate, async (req, res) => {
           emailDate: 1,
           linkedinDate: 1,
           createdBy: 1,
+          createdByUser: { $arrayElemAt: ['$createdByUser', 0] },
           createdAt: 1,
           updatedAt: 1
         }
